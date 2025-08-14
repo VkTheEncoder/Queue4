@@ -6,6 +6,7 @@ from helper_func.queue import Job, job_queue
 from helper_func.mux   import softmux_vid, hardmux_vid, nosub_encode, running_jobs
 from helper_func.progress_bar import progress_bar
 from helper_func.dbhelper       import Database as Db
+from helper_func.settings_manager import SettingsManager
 from config import Config
 
 import uuid, time, os, asyncio
@@ -18,10 +19,9 @@ async def _check_user(filt, client, message):
 check_user = filters.create(_check_user)
 
 # ------------------------------------------------------------------------------
-# Wizard state: users drop files first, then choose mode & name.
-# Keyed by (chat_id, user_id) so it works in groups too.
+# Wizard state (supports groups): key = (chat_id, user_id)
 # ------------------------------------------------------------------------------
-PENDING = {}   # { (chat_id, user_id): { 'vid_id','vid_name','sub_id','sub_name','mode','awaiting_name':bool } }
+PENDING = {}   # {(chat_id, user_id): {'vid_id','vid_name','vid_size','sub_id','sub_name','sub_size','mode','awaiting_name':bool}}
 
 def _mode_keyboard():
     return InlineKeyboardMarkup([[
@@ -34,47 +34,116 @@ def _is_subtitle_name(name: str) -> bool:
     n = (name or "").lower()
     return n.endswith(('.srt','.ass','.ssa','.vtt','.sub','.sbv','.smi'))
 
-def _tg_token(file_id: str, file_name: str) -> str:
+def _tg_token(file_id: str, file_name: str, file_size: int | None) -> str:
     safe_name = os.path.basename(file_name) if file_name else "file.bin"
-    return f"tg:{file_id}::{safe_name}"
+    size_str  = str(file_size or 0)
+    return f"tg:{file_id}::{safe_name}::{size_str}"
 
 def _parse_tg_token(token: str):
     if not token or not token.startswith("tg:"):
-        return None, None
+        return None, None, 0
     try:
         _, rest = token.split("tg:", 1)
-        file_id, file_name = rest.split("::", 1)
-        return file_id, os.path.basename(file_name)
+        file_id, file_name, size_str = rest.split("::", 2)
+        return file_id, os.path.basename(file_name), int(size_str or 0)
     except Exception:
-        return None, None
+        return None, None, 0
 
-# Capture incoming video/subtitle *without* downloading yet
+# ------------------------------------------------------------------------------
+# SETTINGS UI
+# ------------------------------------------------------------------------------
+@Client.on_message(filters.command('settings') & check_user & (filters.private | filters.group))
+async def show_settings(client, message):
+    chat_id = message.chat.id
+    cfg = SettingsManager.get(chat_id) or {}
+
+    text, kb = _render_settings(cfg)
+    await message.reply(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+@Client.on_callback_query(filters.regex(r"^cycle:(res|fps|codec|crf|preset)$") & check_user)
+async def cycle_setting(client, cq):
+    chat_id = cq.message.chat.id
+    cfg = SettingsManager.get(chat_id) or {}
+
+    field = cq.data.split(":", 1)[1]
+    lists = {
+        'res':   ['original','1280:720','1920:1080','2560:1440','3840:2160'],
+        'fps':   ['original','24','30','60'],
+        'codec': ['libx264','libx265'],
+        'crf':   ['18','20','23','27','30'],
+        'preset':['veryslow','slower','slow','medium','fast','faster']
+    }
+    keymap = {'res':'resolution','fps':'fps','codec':'codec','crf':'crf','preset':'preset'}
+    key = keymap[field]
+
+    cur = str(cfg.get(key, lists[field][0]))
+    vals = lists[field]
+    try:
+        nxt = vals[(vals.index(cur) + 1) % len(vals)]
+    except ValueError:
+        nxt = vals[0]
+
+    SettingsManager.set(chat_id, key, nxt)
+    cfg[key] = nxt
+
+    text, kb = _render_settings(cfg)
+    await cq.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+def _render_settings(cfg: dict):
+    res    = cfg.get('resolution','original')
+    fps    = cfg.get('fps','original')
+    codec  = cfg.get('codec','libx264')
+    crf    = cfg.get('crf','27')
+    preset = cfg.get('preset','faster')
+
+    text = (
+        "⚙️ <b>Encoding Settings</b>\n"
+        f"• Resolution: <code>{res}</code>\n"
+        f"• FPS       : <code>{fps}</code>\n"
+        f"• Codec     : <code>{codec}</code>\n"
+        f"• CRF       : <code>{crf}</code>\n"
+        f"• Preset    : <code>{preset}</code>\n\n"
+        "Tap a button to change:"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Resolution ({res})", callback_data="cycle:res")],
+        [InlineKeyboardButton(f"FPS ({fps})",        callback_data="cycle:fps")],
+        [InlineKeyboardButton(f"Codec ({codec})",    callback_data="cycle:codec")],
+        [InlineKeyboardButton(f"CRF ({crf})",        callback_data="cycle:crf")],
+        [InlineKeyboardButton(f"Preset ({preset})",  callback_data="cycle:preset")],
+    ])
+    return text, kb
+
+# ------------------------------------------------------------------------------
+# WIZARD: capture media first (no download yet)
+# ------------------------------------------------------------------------------
 @Client.on_message((filters.video | filters.document) & check_user & (filters.private | filters.group))
 async def capture_media_first(client, message):
     chat_id = message.chat.id
     user_id = message.from_user.id
     st = PENDING.setdefault((chat_id, user_id), {})
 
-    # If it's a subtitle document
+    # Subtitle?
     if message.document and _is_subtitle_name(message.document.file_name or ""):
         st['sub_id']   = message.document.file_id
         st['sub_name'] = message.document.file_name or f"{message.document.file_unique_id}.srt"
+        st['sub_size'] = getattr(message.document, "file_size", 0) or 0
         return await message.reply(
-            "✅ Subtitle saved.\nChoose a mode:",
-            reply_markup=_mode_keyboard()
+            "✅ Subtitle saved.\nChoose a mode:", reply_markup=_mode_keyboard()
         )
 
-    # Otherwise treat as video
+    # Video (video or generic doc)
     if message.video:
         st['vid_id']   = message.video.file_id
         st['vid_name'] = message.video.file_name or f"{message.video.file_unique_id}.mp4"
+        st['vid_size'] = getattr(message.video, "file_size", 0) or 0
     else:
         st['vid_id']   = message.document.file_id
         st['vid_name'] = message.document.file_name or f"{message.document.file_unique_id}.mp4"
+        st['vid_size'] = getattr(message.document, "file_size", 0) or 0
 
     await message.reply("✅ Video saved.\nChoose a mode:", reply_markup=_mode_keyboard())
 
-# Mode selection
 @Client.on_callback_query(filters.regex(r"^mode:(hard|soft|nosub)$") & check_user)
 async def choose_mode(client, cq):
     chat_id = cq.message.chat.id
@@ -97,7 +166,6 @@ async def choose_mode(client, cq):
         parse_mode=ParseMode.HTML
     )
 
-# Receive the output name, then ENQUEUE (downloads will happen inside the worker)
 @Client.on_message(filters.text & check_user & (filters.private | filters.group))
 async def receive_output_name(client, message):
     chat_id = message.chat.id
@@ -121,8 +189,9 @@ async def receive_output_name(client, message):
 
     status = await message.reply("⏳ Queuing…")
 
-    vid_token = _tg_token(st['vid_id'], st['vid_name'])
-    sub_token = _tg_token(st['sub_id'], st['sub_name']) if st['mode'] in ('hard','soft') else None
+    # include file sizes to fix 0B in progress
+    vid_token = _tg_token(st['vid_id'], st['vid_name'], st.get('vid_size', 0))
+    sub_token = _tg_token(st['sub_id'], st['sub_name'], st.get('sub_size', 0)) if st['mode'] in ('hard','soft') else None
 
     job_id = uuid.uuid4().hex[:8]
     await status.edit(
@@ -210,14 +279,16 @@ async def enqueue_nosub(client, message):
     await job_queue.put(Job(job_id, 'nosub', chat_id, vid, None, final_name, status))
     db.erase(chat_id)
 
-# Cancel a job (queued or running)
+# ------------------------------------------------------------------------------
+# CANCEL
+# ------------------------------------------------------------------------------
 @Client.on_message(filters.command('cancel') & check_user & (filters.private | filters.group))
 async def cancel_job(client, message):
     if len(message.command) != 2:
         return await message.reply_text("Usage: /cancel <job_id>", parse_mode=ParseMode.HTML)
     target = message.command[1]
 
-    # Remove from pending queue first
+    # try remove from pending queue
     removed = False
     temp_q  = asyncio.Queue()
     while not job_queue.empty():
@@ -236,16 +307,23 @@ async def cancel_job(client, message):
     if removed:
         return
 
-    # If already running, kill ffmpeg
+    # if running, kill ffmpeg (job_id is unified across stages)
     entry = running_jobs.get(target)
     if not entry:
         return await message.reply_text(
-            f"No job `<code>{target}</code>` found.", parse_mode=ParseMode.HTML
+            f"No running job `<code>{target}</code>` found.", parse_mode=ParseMode.HTML
         )
 
-    entry['proc'].kill()
-    for t in entry['tasks']:
-        t.cancel()
+    try:
+        if entry.get('proc'):
+            entry['proc'].kill()
+    except:
+        pass
+    for t in entry.get('tasks', []):
+        try:
+            t.cancel()
+        except:
+            pass
     running_jobs.pop(target, None)
     await message.reply_text(
         f"🛑 Job `<code>{target}</code>` aborted.", parse_mode=ParseMode.HTML
@@ -270,42 +348,42 @@ async def queue_worker(client: Client):
         def _parse(token):
             if token and token.startswith("tg:"):
                 return _parse_tg_token(token)
-            return None, None
+            return None, None, 0
 
         local_vid = job.vid
         local_sub = job.sub
 
-        # Video download (serialized)
-        vid_id, vid_name = _parse(job.vid)
+        # Video download
+        vid_id, vid_name, vid_size = _parse(job.vid)
         if vid_id:
             t0 = time.time()
             local_vid = await client.download_media(
                 vid_id,
                 file_name=os.path.join(Config.DOWNLOAD_DIR, os.path.basename(vid_name or "video.mp4")),
                 progress=progress_bar,
-                progress_args=("Downloading File", job.status_msg, t0, f"DL-{job.job_id}")
+                progress_args=("Downloading File", job.status_msg, t0, f"DL-{job.job_id}", vid_size)
             )
             local_vid = os.path.basename(local_vid)
 
         # Subtitle download (if any)
-        sub_id, sub_name = _parse(job.sub)
+        sub_id, sub_name, sub_size = _parse(job.sub)
         if sub_id:
             t1 = time.time()
             local_sub = await client.download_media(
                 sub_id,
                 file_name=os.path.join(Config.DOWNLOAD_DIR, os.path.basename(sub_name or "subs.srt")),
                 progress=progress_bar,
-                progress_args=("Downloading Subtitle", job.status_msg, t1, f"DL-{job.job_id}")
+                progress_args=("Downloading Subtitle", job.status_msg, t1, f"DL-{job.job_id}", sub_size)
             )
             local_sub = os.path.basename(local_sub)
 
-        # Encode
+        # Encode (pass the SAME job_id through)
         if job.mode == 'soft':
-            out_file = await softmux_vid(local_vid, local_sub, msg=job.status_msg)
+            out_file = await softmux_vid(local_vid, local_sub, msg=job.status_msg, job_id=job.job_id)
         elif job.mode == 'hard':
-            out_file = await hardmux_vid(local_vid, local_sub, msg=job.status_msg)
+            out_file = await hardmux_vid(local_vid, local_sub, msg=job.status_msg, job_id=job.job_id)
         else:  # nosub
-            out_file = await nosub_encode(local_vid, msg=job.status_msg)
+            out_file = await nosub_encode(local_vid, msg=job.status_msg, job_id=job.job_id)
 
         if out_file:
             # rename to desired final name
@@ -324,7 +402,7 @@ async def queue_worker(client: Client):
                 caption=job.final_name,
                 file_name=job.final_name,
                 progress=progress_bar,
-                progress_args=('Uploading…', job.status_msg, t2, job.job_id)
+                progress_args=('Uploading…', job.status_msg, t2, job.job_id, None)
             )
 
             await job.status_msg.edit(
