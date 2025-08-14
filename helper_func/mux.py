@@ -30,14 +30,6 @@ def _humanrate(bps: float) -> str:
     s = round(bps / p, 2)
     return f"{s} {units[i]}"
 
-def _fmt_time(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h: return f"{h}h {m}m {s}s"
-    if m: return f"{m}m {s}s"
-    return f"{s}s"
-
 def _fmt_hhmmss(seconds: float) -> str:
     seconds = max(0, int(seconds))
     h = seconds // 3600
@@ -73,10 +65,14 @@ async def _probe_duration(vid_path: str) -> float:
     except Exception:
         return 0.0
 
+def _ff_quote(path: str) -> str:
+    """Quote for ffmpeg filter args (single-quoted string)."""
+    return path.replace("\\", "\\\\").replace("'", "\\'")
+
 async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, input_size: int):
     """
-    Tail ffmpeg stderr and render a rich progress card (Size / Speed / Elapsed / ETA / %)
-    with the Job ID visible.
+    Tail ffmpeg stderr and render a rich progress card (Size / Speed / Time / ETA / %)
+    with the Job ID visible. Refresh every ~5s.
     """
     last_edit = 0.0
     curr_time = 0.0   # seconds processed
@@ -96,7 +92,6 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
             except Exception:
                 pass
         elif 'time' in prog:
-            # fallback: 00:00:12.34 -> seconds
             t = prog['time']
             try:
                 h, m, s = t.split(':')
@@ -117,13 +112,12 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
                 pass
 
         if 'speed' in prog and prog['speed'] not in ('N/A', '0x'):
-            # '1.23x'
             try:
                 speed_x = float(prog['speed'].rstrip('x'))
             except Exception:
                 speed_x = 0.0
 
-        # Throttle UI updates (~once every 2s)
+        # Throttle UI updates (~every 5s)
         now = time.time()
         if now - last_edit < 5:
             continue
@@ -147,11 +141,12 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
 
         card = (
             f"📽️ <b>Encoding</b> [<code>{job_id}</code>]\n\n"
-            f"📊 <b>Size:</b> {_humanbytes(curr_size)}\n"
+            f"📊 <b>Size:</b> {_humanbytes(curr_size)}"
+            + (f" of {_humanbytes(input_size)}" if input_size else "") + "\n"
+            f"⚡ <b>Speed:</b> {_humanrate(avg_bps)}\n"
             f"⏱️ <b>Time:</b> {_fmt_hhmmss(curr_time)}\n"
-            f"⚡ <b>Speed:</b> {f'{speed_x:.2f}x' if speed_x else 'N/A'}\n"
-            f"📈 <b>Progress:</b> {pct:.1f}%\n"
-            f"⏳ <b>ETA:</b> {_fmt_time(eta_sec)}\n"
+            f"⏳ <b>ETA:</b> {_fmt_hhmmss(eta_sec)}\n"
+            f"📈 <b>Progress:</b> {pct:.1f}%"
         )
         try:
             await msg.edit(card, parse_mode=ParseMode.HTML)
@@ -165,6 +160,15 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg):
     start    = time.time()
     vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
     sub_path = os.path.join(Config.DOWNLOAD_DIR, sub_filename)
+
+    # Guard missing files
+    if not os.path.isfile(vid_path):
+        await msg.edit("❌ Video file missing after download. Please retry.", parse_mode=ParseMode.HTML)
+        return False
+    if not os.path.isfile(sub_path):
+        await msg.edit("❌ Subtitle file missing after download. Please retry.", parse_mode=ParseMode.HTML)
+        return False
+
     base     = os.path.splitext(vid_filename)[0]
     output   = f"{base}_soft.mkv"
     out_path = os.path.join(Config.DOWNLOAD_DIR, output)
@@ -211,7 +215,7 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg):
         err = await proc.stderr.read()
         await msg.edit(
             "❌ Error during soft-mux!\n\n"
-            f"<pre>{err.decode(errors='ignore')}</pre>",
+            f"<pre>{err.decode(errors='ignore')[:4000]}</pre>",
             parse_mode=ParseMode.HTML
         )
         return False
@@ -232,10 +236,27 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
     vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
     sub_path = os.path.join(Config.DOWNLOAD_DIR, sub_filename)
 
+    # Guard missing files
+    if not os.path.isfile(vid_path):
+        await msg.edit("❌ Video file missing after download. Please retry.", parse_mode=ParseMode.HTML)
+        return False
+    if not os.path.isfile(sub_path):
+        await msg.edit("❌ Subtitle file missing after download. Please retry.", parse_mode=ParseMode.HTML)
+        return False
+
     total_dur  = await _probe_duration(vid_path)
     input_size = os.path.getsize(vid_path) if os.path.exists(vid_path) else 0
 
-    vf = [f"subtitles={sub_path}:fontsdir={Config.FONTS_DIR}"]
+    # Build a safe subtitles filter (works with spaces, [ ], quotes, etc.)
+    vf = []
+    sub_opt = f"subtitles=filename='{_ff_quote(sub_path)}'"
+    if os.path.isdir(getattr(Config, "FONTS_DIR", "") or ""):
+        sub_opt += f":fontsdir='{_ff_quote(Config.FONTS_DIR)}'"
+    ext = os.path.splitext(sub_path)[1].lower()
+    if ext in (".srt", ".sub", ".smi", ".sbv", ".vtt"):
+        sub_opt += ":charenc=UTF-8"
+    vf.append(sub_opt)
+
     if res != 'original':
         vf.append(f"scale={res}")
     if fps != 'original':
@@ -284,7 +305,7 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
         err = await proc.stderr.read()
         await msg.edit(
             "❌ Error during hard-mux!\n\n"
-            f"<pre>{err.decode(errors='ignore')}</pre>",
+            f"<pre>{err.decode(errors='ignore')[:4000]}</pre>",
             parse_mode=ParseMode.HTML
         )
         return False
@@ -303,6 +324,11 @@ async def nosub_encode(vid_filename: str, msg):
     preset = cfg.get('preset','faster')
 
     vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
+
+    if not os.path.isfile(vid_path):
+        await msg.edit("❌ Video file missing after download. Please retry.", parse_mode=ParseMode.HTML)
+        return False
+
     total_dur  = await _probe_duration(vid_path)
     input_size = os.path.getsize(vid_path) if os.path.exists(vid_path) else 0
 
@@ -354,7 +380,7 @@ async def nosub_encode(vid_filename: str, msg):
         err = await proc.stderr.read()
         await msg.edit(
             "❌ Error during encode!\n\n"
-            f"<pre>{err.decode(errors='ignore')}</pre>",
+            f"<pre>{err.decode(errors='ignore')[:4000]}</pre>",
             parse_mode=ParseMode.HTML
         )
         return False
