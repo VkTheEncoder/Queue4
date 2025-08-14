@@ -141,10 +141,11 @@ async def queue_worker(client: Client):
 
             # upload with progress UI
             t0 = time.time()
-            await client.send_video(
+            await client.send_document(
                 job.chat_id,
-                video=dst,
+                document=dst,
                 caption=job.final_name,
+                file_name=job.final_name,   # keep nice filename
                 progress=progress_bar,
                 progress_args=('Uploading…', job.status_msg, t0, job.job_id)
             )
