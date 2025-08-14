@@ -1,386 +1,343 @@
-import os, time, re, uuid, asyncio, math
-from config import Config
-from helper_func.settings_manager import SettingsManager
+from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# Track running jobs so /cancel can kill ffmpeg
-running_jobs: dict[str, dict] = {}
+from helper_func.queue import Job, job_queue
+from helper_func.mux   import softmux_vid, hardmux_vid, nosub_encode, running_jobs
+from helper_func.progress_bar import progress_bar
+from helper_func.dbhelper       import Database as Db
+from config import Config
 
-# Parse both classic ffmpeg stats AND -progress key/value output
-progress_pattern = re.compile(
-    r'(frame|fps|size|time|bitrate|speed|total_size|out_time_ms|progress)\s*=\s*(\S+)'
-)
+import uuid, time, os, asyncio
 
-def _humanbytes(n: int) -> str:
-    if not n:
-        return "0 B"
-    units = ["B","KB","MB","GB","TB","PB"]
-    i = int(math.floor(math.log(n, 1024))) if n > 0 else 0
-    p = math.pow(1024, i)
-    s = round(n / p, 2)
-    return f"{s} {units[i]}"
+db = Db()
 
-def _humanrate(bps: float) -> str:
-    # bytes/sec -> "2.10 MB/s"
-    if bps <= 0:
-        return "N/A"
-    units = ["B/s","KB/s","MB/s","GB/s","TB/s"]
-    i = int(math.floor(math.log(bps, 1024))) if bps > 0 else 0
-    p = math.pow(1024, i)
-    s = round(bps / p, 2)
-    return f"{s} {units[i]}"
+# allow only configured users
+async def _check_user(filt, client, message):
+    return str(message.from_user.id) in Config.ALLOWED_USERS
+check_user = filters.create(_check_user)
 
-def _fmt_hhmmss(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
+# ------------------------------------------------------------------------------
+# Wizard state: users drop files first, then choose mode & name.
+# Keyed by (chat_id, user_id) so it works in groups too.
+# ------------------------------------------------------------------------------
+PENDING = {}   # { (chat_id, user_id): { 'vid_id','vid_name','sub_id','sub_name','mode','awaiting_name':bool } }
 
-def parse_progress(line: str):
-    items = {k: v for k, v in progress_pattern.findall(line)}
-    return items or None
+def _mode_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎞 Hardmux", callback_data="mode:hard"),
+        InlineKeyboardButton("🧩 Softmux",  callback_data="mode:soft"),
+        InlineKeyboardButton("🚫 NoSub",    callback_data="mode:nosub"),
+    ]])
 
-async def readlines(stream):
-    """Yield complete lines from an asyncio stream (handles CR/LF splits)."""
-    pattern = re.compile(br'[\r\n]+')
-    data = bytearray()
-    while not stream.at_eof():
-        parts = pattern.split(data)
-        data[:] = parts.pop(-1)
-        for line in parts:
-            yield line
-        data.extend(await stream.read(1024))
+def _is_subtitle_name(name: str) -> bool:
+    n = (name or "").lower()
+    return n.endswith(('.srt','.ass','.ssa','.vtt','.sub','.sbv','.smi'))
 
-async def _probe_duration(vid_path: str) -> float:
-    """Return total duration (seconds) using ffprobe. 0.0 if unknown."""
-    proc = await asyncio.create_subprocess_exec(
-        'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-        '-of', 'default=noprint_wrappers=1:nokey=1', '-i', vid_path,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    out, _ = await proc.communicate()
+def _tg_token(file_id: str, file_name: str) -> str:
+    safe_name = os.path.basename(file_name) if file_name else "file.bin"
+    return f"tg:{file_id}::{safe_name}"
+
+def _parse_tg_token(token: str):
+    if not token or not token.startswith("tg:"):
+        return None, None
     try:
-        return float(out.decode().strip())
+        _, rest = token.split("tg:", 1)
+        file_id, file_name = rest.split("::", 1)
+        return file_id, os.path.basename(file_name)
     except Exception:
-        return 0.0
+        return None, None
 
-def _ff_quote(path: str) -> str:
-    """Quote for ffmpeg filter args (single-quoted string)."""
-    return path.replace("\\", "\\\\").replace("'", "\\'")
+# Capture incoming video/subtitle *without* downloading yet
+@Client.on_message((filters.video | filters.document) & check_user & (filters.private | filters.group))
+async def capture_media_first(client, message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    st = PENDING.setdefault((chat_id, user_id), {})
 
-async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, input_size: int):
-    """
-    Tail ffmpeg stderr and render a rich progress card (Size / Speed / Time / ETA / %)
-    with the Job ID visible. Refresh every ~5s.
-    """
-    last_edit = 0.0
-    curr_time = 0.0   # seconds processed
-    curr_size = 0     # bytes written (from total_size)
-    speed_x   = 0.0
-
-    async for raw in readlines(proc.stderr):
-        line = raw.decode(errors='ignore')
-        prog = parse_progress(line)
-        if not prog:
-            continue
-
-        # Pull fields
-        if 'out_time_ms' in prog:
-            try:
-                curr_time = int(prog['out_time_ms']) / 1_000_000.0
-            except Exception:
-                pass
-        elif 'time' in prog:
-            t = prog['time']
-            try:
-                h, m, s = t.split(':')
-                curr_time = int(h) * 3600 + int(m) * 60 + float(s)
-            except Exception:
-                pass
-
-        if 'total_size' in prog:
-            try:
-                curr_size = int(prog['total_size'])
-            except Exception:
-                pass
-        elif 'size' in prog and prog['size'].endswith('kB'):
-            try:
-                kb = float(prog['size'].replace('kB',''))
-                curr_size = int(kb * 1024)
-            except Exception:
-                pass
-
-        if 'speed' in prog and prog['speed'] not in ('N/A', '0x'):
-            try:
-                speed_x = float(prog['speed'].rstrip('x'))
-            except Exception:
-                speed_x = 0.0
-
-        # Throttle UI updates (~every 5s)
-        now = time.time()
-        if now - last_edit < 5:
-            continue
-        last_edit = now
-
-        # Percent and ETA
-        pct = 0.0
-        eta_sec = 0
-        if total_dur > 0:
-            pct = min(100.0, (curr_time / total_dur) * 100.0)
-            if speed_x > 0:
-                eta_sec = max(0, int((total_dur - curr_time) / speed_x))
-            elif curr_time > 0:
-                # fallback ETA from avg processing rate
-                speed_factor = curr_time / (now - start)  # (sec encoded) per wall sec
-                if speed_factor > 0:
-                    eta_sec = max(0, int((total_dur - curr_time) / speed_factor))
-
-        elapsed = now - start
-        avg_bps = curr_size / elapsed if elapsed > 0 else 0.0
-
-        card = (
-            f"📽️ <b>Encoding</b> [<code>{job_id}</code>]\n\n"
-            f"📊 <b>Size:</b> {_humanbytes(curr_size)}"
-            + (f" of {_humanbytes(input_size)}" if input_size else "") + "\n"
-            f"⚡ <b>Speed:</b> {_humanrate(avg_bps)}\n"
-            f"⏱️ <b>Time:</b> {_fmt_hhmmss(curr_time)}\n"
-            f"⏳ <b>ETA:</b> {_fmt_hhmmss(eta_sec)}\n"
-            f"📈 <b>Progress:</b> {pct:.1f}%"
+    # If it's a subtitle document
+    if message.document and _is_subtitle_name(message.document.file_name or ""):
+        st['sub_id']   = message.document.file_id
+        st['sub_name'] = message.document.file_name or f"{message.document.file_unique_id}.srt"
+        return await message.reply(
+            "✅ Subtitle saved.\nChoose a mode:",
+            reply_markup=_mode_keyboard()
         )
-        try:
-            await msg.edit(card, parse_mode=ParseMode.HTML)
-        except:
-            pass
 
+    # Otherwise treat as video
+    if message.video:
+        st['vid_id']   = message.video.file_id
+        st['vid_name'] = message.video.file_name or f"{message.video.file_unique_id}.mp4"
+    else:
+        st['vid_id']   = message.document.file_id
+        st['vid_name'] = message.document.file_name or f"{message.document.file_unique_id}.mp4"
 
-# ============ SOFT-MUX ============
+    await message.reply("✅ Video saved.\nChoose a mode:", reply_markup=_mode_keyboard())
 
-async def softmux_vid(vid_filename: str, sub_filename: str, msg):
-    start    = time.time()
-    vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
-    sub_path = os.path.join(Config.DOWNLOAD_DIR, sub_filename)
+# Mode selection
+@Client.on_callback_query(filters.regex(r"^mode:(hard|soft|nosub)$") & check_user)
+async def choose_mode(client, cq):
+    chat_id = cq.message.chat.id
+    user_id = cq.from_user.id
+    st = PENDING.setdefault((chat_id, user_id), {})
+    mode = cq.data.split(":")[1]
+    st['mode'] = mode
 
-    # Guard missing files
-    if not os.path.isfile(vid_path):
-        await msg.edit("❌ Video file missing after download. Please retry.", parse_mode=ParseMode.HTML)
-        return False
-    if not os.path.isfile(sub_path):
-        await msg.edit("❌ Subtitle file missing after download. Please retry.", parse_mode=ParseMode.HTML)
-        return False
+    if mode in ('hard','soft') and not st.get('sub_id'):
+        return await cq.message.edit_text(
+            f"Mode set: <b>{'Hardmux' if mode=='hard' else 'Softmux'}</b>\n"
+            "Now send a subtitle file (*.srt, *.ass, *.vtt).",
+            parse_mode=ParseMode.HTML
+        )
 
-    base     = os.path.splitext(vid_filename)[0]
-    output   = f"{base}_soft.mkv"
-    out_path = os.path.join(Config.DOWNLOAD_DIR, output)
-    sub_ext  = os.path.splitext(sub_filename)[1].lstrip('.')
-
-    total_dur  = await _probe_duration(vid_path)
-    input_size = os.path.getsize(vid_path) if os.path.exists(vid_path) else 0
-
-    proc = await asyncio.create_subprocess_exec(
-        'ffmpeg', '-hide_banner',
-        '-progress', 'pipe:2', '-nostats',
-        '-i', vid_path, '-i', sub_path,
-        '-map', '1:0', '-map', '0',
-        '-disposition:s:0', 'default',
-        '-c:v', 'copy', '-c:a', 'copy',
-        f'-c:s', sub_ext,
-        '-y', out_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    job_id = uuid.uuid4().hex[:8]
-    reader = asyncio.create_task(read_stderr(start, msg, proc, job_id, total_dur, input_size))
-    waiter = asyncio.create_task(proc.wait())
-    running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter]}
-
-    await msg.edit(
-        f"🔄 Soft-Mux job started: <code>{job_id}</code>\n"
-        f"Send <code>/cancel {job_id}</code> to abort",
+    st['awaiting_name'] = True
+    await cq.message.edit_text(
+        f"Mode set: <b>{'Hardmux' if mode=='hard' else 'Softmux' if mode=='soft' else 'NoSub'}</b>\n"
+        "Send the <b>output file name with extension</b> or type <code>default</code>.",
         parse_mode=ParseMode.HTML
     )
 
-    await asyncio.wait([reader, waiter])
-    running_jobs.pop(job_id, None)
+# Receive the output name, then ENQUEUE (downloads will happen inside the worker)
+@Client.on_message(filters.text & check_user & (filters.private | filters.group))
+async def receive_output_name(client, message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    st = PENDING.get((chat_id, user_id))
+    if not st or not st.get('awaiting_name'):
+        return
 
-    if proc.returncode == 0:
-        await msg.edit(
-            f"✅ Soft-Mux `<code>{job_id}</code>` completed in {round(time.time()-start)}s",
-            parse_mode=ParseMode.HTML
-        )
-        await asyncio.sleep(2)
-        return output
+    if not st.get('vid_id'):
+        return await message.reply("Please send a video first.")
+    if st.get('mode') in ('hard','soft') and not st.get('sub_id'):
+        return await message.reply("Please send a subtitle file for the selected mode.")
+
+    txt = message.text.strip()
+    if txt.lower() == "default":
+        base, _ = os.path.splitext(st['vid_name'])
+        suffix = {'hard': '_hard.mp4', 'soft': '_soft.mkv', 'nosub': '_enc.mp4'}[st['mode']]
+        final_name = base + suffix
     else:
-        err = await proc.stderr.read()
-        await msg.edit(
-            "❌ Error during soft-mux!\n\n"
-            f"<pre>{err.decode(errors='ignore')[:4000]}</pre>",
-            parse_mode=ParseMode.HTML
-        )
-        return False
+        final_name = os.path.basename(txt)
 
+    status = await message.reply("⏳ Queuing…")
 
-# ============ HARD-MUX ============
-
-async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
-    start    = time.time()
-    cfg      = SettingsManager.get(msg.chat.id)
-
-    res    = cfg.get('resolution','1920:1080')
-    fps    = cfg.get('fps','original')
-    codec  = cfg.get('codec','libx264')
-    crf    = cfg.get('crf','27')
-    preset = cfg.get('preset','faster')
-
-    vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
-    sub_path = os.path.join(Config.DOWNLOAD_DIR, sub_filename)
-
-    # Guard missing files
-    if not os.path.isfile(vid_path):
-        await msg.edit("❌ Video file missing after download. Please retry.", parse_mode=ParseMode.HTML)
-        return False
-    if not os.path.isfile(sub_path):
-        await msg.edit("❌ Subtitle file missing after download. Please retry.", parse_mode=ParseMode.HTML)
-        return False
-
-    total_dur  = await _probe_duration(vid_path)
-    input_size = os.path.getsize(vid_path) if os.path.exists(vid_path) else 0
-
-    # Build a safe subtitles filter (works with spaces, [ ], quotes, etc.)
-    vf = []
-    sub_opt = f"subtitles=filename='{_ff_quote(sub_path)}'"
-    if os.path.isdir(getattr(Config, "FONTS_DIR", "") or ""):
-        sub_opt += f":fontsdir='{_ff_quote(Config.FONTS_DIR)}'"
-    ext = os.path.splitext(sub_path)[1].lower()
-    if ext in (".srt", ".sub", ".smi", ".sbv", ".vtt"):
-        sub_opt += ":charenc=UTF-8"
-    vf.append(sub_opt)
-
-    if res != 'original':
-        vf.append(f"scale={res}")
-    if fps != 'original':
-        vf.append(f"fps={fps}")
-    vf_arg = ",".join(vf)
-
-    base     = os.path.splitext(vid_filename)[0]
-    output   = f"{base}_hard.mp4"
-    out_path = os.path.join(Config.DOWNLOAD_DIR, output)
-
-    proc = await asyncio.create_subprocess_exec(
-        'ffmpeg','-hide_banner',
-        '-progress', 'pipe:2', '-nostats',
-        '-i', vid_path,
-        '-vf', vf_arg,
-        '-c:v', codec, '-preset', preset, '-crf', crf,
-        '-map','0:v:0','-map','0:a:0?',
-        '-c:a','copy',
-        '-y', out_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
+    vid_token = _tg_token(st['vid_id'], st['vid_name'])
+    sub_token = _tg_token(st['sub_id'], st['sub_name']) if st['mode'] in ('hard','soft') else None
 
     job_id = uuid.uuid4().hex[:8]
-    reader = asyncio.create_task(read_stderr(start, msg, proc, job_id, total_dur, input_size))
-    waiter = asyncio.create_task(proc.wait())
-    running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter]}
-
-    await msg.edit(
-        f"🔄 Hard-Mux job started: <code>{job_id}</code>\n"
-        f"Send <code>/cancel {job_id}</code> to abort",
+    await status.edit(
+        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
         parse_mode=ParseMode.HTML
     )
+    await job_queue.put(Job(
+        job_id,
+        st['mode'],
+        chat_id,
+        vid_token,
+        sub_token,
+        final_name,
+        status
+    ))
 
-    await asyncio.wait([reader, waiter])
-    running_jobs.pop(job_id, None)
+    PENDING.pop((chat_id, user_id), None)
 
-    if proc.returncode == 0:
-        await msg.edit(
-            f"✅ Hard-Mux `<code>{job_id}</code>` completed in {round(time.time()-start)}s",
-            parse_mode=ParseMode.HTML
-        )
-        await asyncio.sleep(2)
-        return output
-    else:
-        err = await proc.stderr.read()
-        await msg.edit(
-            "❌ Error during hard-mux!\n\n"
-            f"<pre>{err.decode(errors='ignore')[:4000]}</pre>",
-            parse_mode=ParseMode.HTML
-        )
-        return False
+@Client.on_message(filters.command('reset') & check_user & (filters.private | filters.group))
+async def reset_pending(client, message):
+    key = (message.chat.id, message.from_user.id)
+    PENDING.pop(key, None)
+    await message.reply("🧹 Cleared pending setup. Send a video/subtitle again to start.")
 
+# ------------------------------------------------------------------------------
+# Legacy COMMAND workflows (kept for power users)
+# ------------------------------------------------------------------------------
 
-# ============ NO-SUB (encode only) ============
+@Client.on_message(filters.command('softmux') & check_user & (filters.private | filters.group))
+async def enqueue_soft(client, message):
+    chat_id = message.chat.id
+    vid     = db.get_vid_filename(chat_id)
+    sub     = db.get_sub_filename(chat_id)
+    if not vid or not sub:
+        text = ''
+        if not vid: text += 'First send a Video File\n'
+        if not sub: text += 'Send a Subtitle File!'
+        return await client.send_message(chat_id, text, parse_mode=ParseMode.HTML)
 
-async def nosub_encode(vid_filename: str, msg):
-    start    = time.time()
-    cfg      = SettingsManager.get(msg.chat.id)
-
-    res    = cfg.get('resolution','1920:1080')
-    fps    = cfg.get('fps','original')
-    codec  = cfg.get('codec','libx264')
-    crf    = cfg.get('crf','27')
-    preset = cfg.get('preset','faster')
-
-    vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
-
-    if not os.path.isfile(vid_path):
-        await msg.edit("❌ Video file missing after download. Please retry.", parse_mode=ParseMode.HTML)
-        return False
-
-    total_dur  = await _probe_duration(vid_path)
-    input_size = os.path.getsize(vid_path) if os.path.exists(vid_path) else 0
-
-    vf = []
-    if res != 'original':
-        vf.append(f"scale={res}")
-    if fps != 'original':
-        vf.append(f"fps={fps}")
-    vf_args = ['-vf', ",".join(vf)] if vf else []
-
-    base     = os.path.splitext(vid_filename)[0]
-    output   = f"{base}_enc.mp4"
-    out_path = os.path.join(Config.DOWNLOAD_DIR, output)
-
-    proc = await asyncio.create_subprocess_exec(
-        'ffmpeg','-hide_banner',
-        '-progress','pipe:2','-nostats',
-        '-i', vid_path, *vf_args,
-        '-c:v', codec, '-preset', preset, '-crf', crf,
-        '-map','0:v:0','-map','0:a:0?',
-        '-c:a','copy',
-        '-y', out_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    job_id = uuid.uuid4().hex[:8]
-    reader = asyncio.create_task(read_stderr(start, msg, proc, job_id, total_dur, input_size))
-    waiter = asyncio.create_task(proc.wait())
-    running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter]}
-
-    await msg.edit(
-        f"🔄 Encode (no-sub) job started: <code>{job_id}</code>\n"
-        f"Send <code>/cancel {job_id}</code> to abort",
+    final_name = db.get_filename(chat_id)
+    job_id     = uuid.uuid4().hex[:8]
+    status     = await client.send_message(
+        chat_id,
+        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
         parse_mode=ParseMode.HTML
     )
+    await job_queue.put(Job(job_id, 'soft', chat_id, vid, sub, final_name, status))
+    db.erase(chat_id)
 
-    await asyncio.wait([reader, waiter])
-    running_jobs.pop(job_id, None)
+@Client.on_message(filters.command('hardmux') & check_user & (filters.private | filters.group))
+async def enqueue_hard(client, message):
+    chat_id = message.chat.id
+    vid     = db.get_vid_filename(chat_id)
+    sub     = db.get_sub_filename(chat_id)
+    if not vid or not sub:
+        text = ''
+        if not vid: text += 'First send a Video File\n'
+        if not sub: text += 'Send a Subtitle File!'
+        return await client.send_message(chat_id, text, parse_mode=ParseMode.HTML)
 
-    if proc.returncode == 0:
-        await msg.edit(
-            f"✅ Encode `<code>{job_id}</code>` completed in {round(time.time()-start)}s",
+    final_name = db.get_filename(chat_id)
+    job_id     = uuid.uuid4().hex[:8]
+    status     = await client.send_message(
+        chat_id,
+        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
+        parse_mode=ParseMode.HTML
+    )
+    await job_queue.put(Job(job_id, 'hard', chat_id, vid, sub, final_name, status))
+    db.erase(chat_id)
+
+@Client.on_message(filters.command('nosub') & check_user & (filters.private | filters.group))
+async def enqueue_nosub(client, message):
+    chat_id = message.chat.id
+    vid     = db.get_vid_filename(chat_id)
+    if not vid:
+        return await client.send_message(chat_id, 'First send a Video File', parse_mode=ParseMode.HTML)
+
+    final_name = db.get_filename(chat_id)
+    job_id     = uuid.uuid4().hex[:8]
+    status     = await client.send_message(
+        chat_id,
+        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
+        parse_mode=ParseMode.HTML
+    )
+    await job_queue.put(Job(job_id, 'nosub', chat_id, vid, None, final_name, status))
+    db.erase(chat_id)
+
+# Cancel a job (queued or running)
+@Client.on_message(filters.command('cancel') & check_user & (filters.private | filters.group))
+async def cancel_job(client, message):
+    if len(message.command) != 2:
+        return await message.reply_text("Usage: /cancel <job_id>", parse_mode=ParseMode.HTML)
+    target = message.command[1]
+
+    # Remove from pending queue first
+    removed = False
+    temp_q  = asyncio.Queue()
+    while not job_queue.empty():
+        job = await job_queue.get()
+        if job.job_id == target:
+            removed = True
+            await job.status_msg.edit(
+                f"❌ Job <code>{target}</code> cancelled before start.", parse_mode=ParseMode.HTML
+            )
+        else:
+            await temp_q.put(job)
+        job_queue.task_done()
+    while not temp_q.empty():
+        await job_queue.put(await temp_q.get())
+
+    if removed:
+        return
+
+    # If already running, kill ffmpeg
+    entry = running_jobs.get(target)
+    if not entry:
+        return await message.reply_text(
+            f"No job `<code>{target}</code>` found.", parse_mode=ParseMode.HTML
+        )
+
+    entry['proc'].kill()
+    for t in entry['tasks']:
+        t.cancel()
+    running_jobs.pop(target, None)
+    await message.reply_text(
+        f"🛑 Job `<code>{target}</code>` aborted.", parse_mode=ParseMode.HTML
+    )
+
+# ------------------------------------------------------------------------------
+# Worker — downloads INSIDE the queue, one job at a time
+# ------------------------------------------------------------------------------
+
+async def queue_worker(client: Client):
+    os.makedirs(Config.DOWNLOAD_DIR, exist_ok=True)
+
+    while True:
+        job = await job_queue.get()
+
+        await job.status_msg.edit(
+            f"▶️ Starting <code>{job.job_id}</code> ({job.mode})…  "
+            f"Use <code>/cancel {job.job_id}</code> to abort.",
             parse_mode=ParseMode.HTML
         )
-        await asyncio.sleep(2)
-        return output
-    else:
-        err = await proc.stderr.read()
-        await msg.edit(
-            "❌ Error during encode!\n\n"
-            f"<pre>{err.decode(errors='ignore')[:4000]}</pre>",
-            parse_mode=ParseMode.HTML
-        )
-        return False
+
+        def _parse(token):
+            if token and token.startswith("tg:"):
+                return _parse_tg_token(token)
+            return None, None
+
+        local_vid = job.vid
+        local_sub = job.sub
+
+        # Video download (serialized)
+        vid_id, vid_name = _parse(job.vid)
+        if vid_id:
+            t0 = time.time()
+            local_vid = await client.download_media(
+                vid_id,
+                file_name=os.path.join(Config.DOWNLOAD_DIR, os.path.basename(vid_name or "video.mp4")),
+                progress=progress_bar,
+                progress_args=("Downloading File", job.status_msg, t0, f"DL-{job.job_id}")
+            )
+            local_vid = os.path.basename(local_vid)
+
+        # Subtitle download (if any)
+        sub_id, sub_name = _parse(job.sub)
+        if sub_id:
+            t1 = time.time()
+            local_sub = await client.download_media(
+                sub_id,
+                file_name=os.path.join(Config.DOWNLOAD_DIR, os.path.basename(sub_name or "subs.srt")),
+                progress=progress_bar,
+                progress_args=("Downloading Subtitle", job.status_msg, t1, f"DL-{job.job_id}")
+            )
+            local_sub = os.path.basename(local_sub)
+
+        # Encode
+        if job.mode == 'soft':
+            out_file = await softmux_vid(local_vid, local_sub, msg=job.status_msg)
+        elif job.mode == 'hard':
+            out_file = await hardmux_vid(local_vid, local_sub, msg=job.status_msg)
+        else:  # nosub
+            out_file = await nosub_encode(local_vid, msg=job.status_msg)
+
+        if out_file:
+            # rename to desired final name
+            src = os.path.join(Config.DOWNLOAD_DIR, out_file)
+            dst = os.path.join(Config.DOWNLOAD_DIR, job.final_name)
+            try:
+                os.rename(src, dst)
+            except Exception:
+                dst = src  # fallback
+
+            # upload as DOCUMENT with progress
+            t2 = time.time()
+            await client.send_document(
+                job.chat_id,
+                document=dst,
+                caption=job.final_name,
+                file_name=job.final_name,
+                progress=progress_bar,
+                progress_args=('Uploading…', job.status_msg, t2, job.job_id)
+            )
+
+            await job.status_msg.edit(
+                f"✅ Job <code>{job.job_id}</code> done.",
+                parse_mode=ParseMode.HTML
+            )
+
+            # cleanup
+            for fn in (local_vid, local_sub, job.final_name):
+                try:
+                    if fn:
+                        os.remove(os.path.join(Config.DOWNLOAD_DIR, fn))
+                except:
+                    pass
+
+        job_queue.task_done()
