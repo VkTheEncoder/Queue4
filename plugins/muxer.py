@@ -1,3 +1,5 @@
+# plugins/muxer.py
+
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -56,7 +58,6 @@ def _parse_tg_token(token: str):
 async def show_settings(client, message):
     chat_id = message.chat.id
     cfg = SettingsManager.get(chat_id) or {}
-
     text, kb = _render_settings(cfg)
     await message.reply(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -280,15 +281,15 @@ async def enqueue_nosub(client, message):
     db.erase(chat_id)
 
 # ------------------------------------------------------------------------------
-# CANCEL
+# CANCEL (works during both download and encode)
 # ------------------------------------------------------------------------------
 @Client.on_message(filters.command('cancel') & check_user & (filters.private | filters.group))
 async def cancel_job(client, message):
     if len(message.command) != 2:
         return await message.reply_text("Usage: /cancel <job_id>", parse_mode=ParseMode.HTML)
-    target = message.command[1]
+    target = message.command[1].strip()
 
-    # try remove from pending queue
+    # Remove from pending queue first
     removed = False
     temp_q  = asyncio.Queue()
     while not job_queue.empty():
@@ -307,24 +308,43 @@ async def cancel_job(client, message):
     if removed:
         return
 
-    # if running, kill ffmpeg (job_id is unified across stages)
+    # If running (download or encode), stop it
     entry = running_jobs.get(target)
     if not entry:
         return await message.reply_text(
             f"No running job `<code>{target}</code>` found.", parse_mode=ParseMode.HTML
         )
 
-    try:
-        if entry.get('proc'):
-            entry['proc'].kill()
-    except:
-        pass
-    for t in entry.get('tasks', []):
+    # Cancel download task if present
+    dl_task = entry.get('dl_task')
+    if dl_task:
         try:
-            t.cancel()
+            dl_task.cancel()
         except:
             pass
-    running_jobs.pop(target, None)
+        # clean any partial file
+        path = entry.get('dl_path')
+        if path:
+            for candidate in (path, path + ".temp"):
+                try:
+                    if os.path.exists(candidate):
+                        os.remove(candidate)
+                except:
+                    pass
+
+    # Kill ffmpeg if present
+    proc = entry.get('proc')
+    if proc:
+        try:
+            proc.kill()
+        except:
+            pass
+        for t in entry.get('tasks', []):
+            try:
+                t.cancel()
+            except:
+                pass
+
     await message.reply_text(
         f"🛑 Job `<code>{target}</code>` aborted.", parse_mode=ParseMode.HTML
     )
@@ -353,31 +373,60 @@ async def queue_worker(client: Client):
         local_vid = job.vid
         local_sub = job.sub
 
-        # Video download
+        # -------------------- Video download (cancel-aware) --------------------
         vid_id, vid_name, vid_size = _parse(job.vid)
         if vid_id:
-            t0 = time.time()
-            local_vid = await client.download_media(
-                vid_id,
-                file_name=os.path.join(Config.DOWNLOAD_DIR, os.path.basename(vid_name or "video.mp4")),
-                progress=progress_bar,
-                progress_args=("Downloading File", job.status_msg, t0, f"DL-{job.job_id}", vid_size)
+            target_path = os.path.join(Config.DOWNLOAD_DIR, os.path.basename(vid_name or "video.mp4"))
+            # Register this job as "downloading"
+            dl_task = asyncio.create_task(
+                client.download_media(
+                    vid_id,
+                    file_name=target_path,
+                    progress=progress_bar,
+                    progress_args=("Downloading File", job.status_msg, time.time(), job.job_id, vid_size)
+                )
             )
-            local_vid = os.path.basename(local_vid)
+            running_jobs[job.job_id] = {'dl_task': dl_task, 'dl_path': target_path}
+            try:
+                local_vid = await dl_task
+                local_vid = os.path.basename(local_vid)
+            except asyncio.CancelledError:
+                # Cancelled by /cancel
+                running_jobs.pop(job.job_id, None)
+                await job.status_msg.edit(
+                    f"🛑 Job <code>{job.job_id}</code> cancelled during download.", parse_mode=ParseMode.HTML
+                )
+                job_queue.task_done()
+                continue
 
-        # Subtitle download (if any)
+        # -------------------- Subtitle download (cancel-aware) --------------------
         sub_id, sub_name, sub_size = _parse(job.sub)
         if sub_id:
-            t1 = time.time()
-            local_sub = await client.download_media(
-                sub_id,
-                file_name=os.path.join(Config.DOWNLOAD_DIR, os.path.basename(sub_name or "subs.srt")),
-                progress=progress_bar,
-                progress_args=("Downloading Subtitle", job.status_msg, t1, f"DL-{job.job_id}", sub_size)
+            target_path = os.path.join(Config.DOWNLOAD_DIR, os.path.basename(sub_name or "subs.srt"))
+            dl_task = asyncio.create_task(
+                client.download_media(
+                    sub_id,
+                    file_name=target_path,
+                    progress=progress_bar,
+                    progress_args=("Downloading Subtitle", job.status_msg, time.time(), job.job_id, sub_size)
+                )
             )
-            local_sub = os.path.basename(local_sub)
+            running_jobs[job.job_id] = {'dl_task': dl_task, 'dl_path': target_path}
+            try:
+                local_sub = await dl_task
+                local_sub = os.path.basename(local_sub)
+            except asyncio.CancelledError:
+                running_jobs.pop(job.job_id, None)
+                await job.status_msg.edit(
+                    f"🛑 Job <code>{job.job_id}</code> cancelled during subtitle download.", parse_mode=ParseMode.HTML
+                )
+                job_queue.task_done()
+                continue
 
-        # Encode (pass the SAME job_id through)
+        # -------------------- Encode --------------------
+        # Switch entry to ffmpeg process (so /cancel kills it)
+        running_jobs.pop(job.job_id, None)
+
         if job.mode == 'soft':
             out_file = await softmux_vid(local_vid, local_sub, msg=job.status_msg, job_id=job.job_id)
         elif job.mode == 'hard':
