@@ -4,7 +4,7 @@ from pyrogram.types import Message
 from helper_func.queue import Job, job_queue
 from helper_func.mux   import softmux_vid, hardmux_vid, nosub_encode, running_jobs
 from helper_func.progress_bar import progress_bar
-from helper_func.dbhelper import Database as Db
+from helper_func.dbhelper       import Database as Db
 from config import Config
 import uuid, time, os, asyncio, re
 
@@ -15,22 +15,14 @@ async def _check_user(filt, client, message):
 check_user = filters.create(_check_user)
 
 def _sanitize_name(name: str, default_ext: str) -> str:
-    """
-    Keep letters, numbers, space, dot, dash, underscore.
-    Ensure it has an extension (uses default_ext if missing).
-    Enforce sane length.
-    """
+    """Keep safe chars and ensure an extension."""
     name = name.strip()
-    # remove path separators and weird chars
-    name = re.sub(r'[\\/]+', '', name)
-    name = re.sub(r'[^A-Za-z0-9._ -]+', '', name).strip()
-    # avoid empty
+    name = re.sub(r'[\\/]+', '', name)                    # strip path sep
+    name = re.sub(r'[^A-Za-z0-9._ -]+', '', name).strip() # strip weird chars
     if not name:
         name = f"output{default_ext}"
-    # add default extension if missing
     if '.' not in os.path.basename(name):
         name = name + default_ext
-    # overly long filenames can be rejected by FS or Telegram
     if len(name) > 180:
         root, ext = os.path.splitext(name)
         name = root[:160] + ext
@@ -38,16 +30,15 @@ def _sanitize_name(name: str, default_ext: str) -> str:
 
 async def _ask_for_name(client: Client, chat_id: int, mode: str, default_name: str) -> str:
     """
-    Ask the user for the upload file name.
-    Returns a safe final name (always includes extension).
-    If timeout/no input, returns default_name.
+    Ask user for a final filename. Returns sanitized name (with extension).
+    Timeout falls back to default_name.
     """
     prompt = await client.send_message(
         chat_id,
         (
             f"✍️ <b>Rename?</b>\n"
-            f"Send the file name you want (without path).<br>"
-            f"Default: <code>{default_name}</code><br><br>"
+            f"Send the file name you want (no path).\n"
+            f"Default: <code>{default_name}</code>\n\n"
             f"• Send <code>.</code> or <code>skip</code> to keep default."
         ),
         parse_mode=ParseMode.HTML
@@ -62,152 +53,184 @@ async def _ask_for_name(client: Client, chat_id: int, mode: str, default_name: s
         await prompt.edit("⏱️ No response. Using default name.", parse_mode=ParseMode.HTML)
         return default_name
 
-    text = reply.text.strip()
-    if text in (".", "skip", "SKIP", "Skip"):
+    user_text = (reply.text or "").strip()
+    if user_text.lower() in (".", "skip"):
         return default_name
 
     default_ext = os.path.splitext(default_name)[1] or ".mp4"
-    safe_name = _sanitize_name(text, default_ext)
-    await prompt.edit(f"✅ Using file name: <code>{safe_name}</code>", parse_mode=ParseMode.HTML)
-    return safe_name
+    safe = _sanitize_name(user_text, default_ext)
+    await prompt.edit(f"✅ Using file name: <code>{safe}</code>", parse_mode=ParseMode.HTML)
+    return safe
 
-@Client.on_message(check_user & filters.command(["softmux", "hardmux", "nosub"]))
-async def enqueue_job(client: Client, message: Message):
-    """
-    Enqueue a job. We grab the latest video/sub from DB and push to queue.
-    """
-    user_id = message.from_user.id
-    chat_id = message.chat.id
+# ===== enqueue handlers =====
 
-    has_video = db.check_video(chat_id)
-    has_sub   = db.check_sub(chat_id)
+@Client.on_message(check_user & filters.command(["softmux"]) & filters.private)
+async def enqueue_soft(client: Client, message: Message):
+    chat_id = message.from_user.id
+    if not db.check_video(chat_id) or not db.check_sub(chat_id):
+        msg = []
+        if not db.check_video(chat_id): msg.append("send a Video file")
+        if not db.check_sub(chat_id):   msg.append("send a Subtitle file")
+        return await client.send_message(chat_id, "❌ Please " + " and ".join(msg) + " first.", parse_mode=ParseMode.HTML)
 
-    mode = message.command[0].lower()  # "softmux" | "hardmux" | "nosub"
+    vid = db.get_vid_filename(chat_id)  # old-API getter
+    sub = db.get_sub_filename(chat_id)  # old-API getter
 
-    if mode in ("softmux", "hardmux") and (not has_video or not has_sub):
-        return await message.reply("❌ Need both a video and a subtitle file first.")
-    if mode == "nosub" and not has_video:
-        return await message.reply("❌ Need a video file first.")
+    # sensible default (old saved original name if any)
+    default_final = db.get_filename(chat_id) or (os.path.splitext(vid)[0] + "_soft.mkv")
+    final_name = await _ask_for_name(client, chat_id, "soft", default_final)
 
-    vid = db.get_video(chat_id)
-    sub = db.get_sub(chat_id) if mode in ("softmux", "hardmux") else None
-
-    # pick a default output filename
-    base_default = os.path.splitext(vid)[0] + (".mp4" if mode != "softmux" else ".mkv")
-    status_msg = await message.reply(
-        f"🧾 Queued <code>{mode}</code> job...\n"
-        f"Video: <code>{vid}</code>\n"
-        + (f"Subs: <code>{sub}</code>\n" if sub else "")
-        + "You'll be asked for a final file name before upload.",
+    job_id = uuid.uuid4().hex[:8]
+    status = await client.send_message(
+        chat_id,
+        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
         parse_mode=ParseMode.HTML
     )
 
-    job = Job(
-        job_id=str(uuid.uuid4())[:8],
-        mode=mode,
-        chat_id=chat_id,
-        vid=vid,
-        sub=sub,
-        final_name=base_default,
-        status_msg=status_msg
+    await job_queue.put(Job(job_id, "soft", chat_id, vid, sub, final_name, status))
+    db.erase(chat_id)  # allow new uploads immediately
+
+@Client.on_message(check_user & filters.command(["hardmux"]) & filters.private)
+async def enqueue_hard(client: Client, message: Message):
+    chat_id = message.from_user.id
+    if not db.check_video(chat_id) or not db.check_sub(chat_id):
+        msg = []
+        if not db.check_video(chat_id): msg.append("send a Video file")
+        if not db.check_sub(chat_id):   msg.append("send a Subtitle file")
+        return await client.send_message(chat_id, "❌ Please " + " and ".join(msg) + " first.", parse_mode=ParseMode.HTML)
+
+    vid = db.get_vid_filename(chat_id)
+    sub = db.get_sub_filename(chat_id)
+
+    default_final = db.get_filename(chat_id) or (os.path.splitext(vid)[0] + "_hard.mp4")
+    final_name = await _ask_for_name(client, chat_id, "hard", default_final)
+
+    job_id = uuid.uuid4().hex[:8]
+    status = await client.send_message(
+        chat_id,
+        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
+        parse_mode=ParseMode.HTML
     )
-    await job_queue.put(job)
 
-async def _do_upload(client: Client, chat_id: int, path: str, file_name: str, status_msg: Message, t0: float, job_id: str):
-    size_total = os.path.getsize(path)
+    await job_queue.put(Job(job_id, "hard", chat_id, vid, sub, final_name, status))
+    db.erase(chat_id)
 
-    async def _progress(current, total):
-        await progress_bar(current, total, 'Uploading…', status_msg, t0, job_id)
+@Client.on_message(check_user & filters.command(["nosub"]) & filters.private)
+async def enqueue_nosub(client: Client, message: Message):
+    chat_id = message.from_user.id
+    if not db.check_video(chat_id):
+        return await client.send_message(chat_id, "❌ Please send a Video file first.", parse_mode=ParseMode.HTML)
 
-    await client.send_document(
-        chat_id=chat_id,
-        document=path,
-        file_name=file_name,
-        caption=f"✅ <b>Done:</b> <code>{file_name}</code>",
-        parse_mode=ParseMode.HTML,
-        progress=_progress
+    vid = db.get_vid_filename(chat_id)
+    default_final = db.get_filename(chat_id) or (os.path.splitext(vid)[0] + "_nosub.mp4")
+    final_name = await _ask_for_name(client, chat_id, "nosub", default_final)
+
+    job_id = uuid.uuid4().hex[:8]
+    status = await client.send_message(
+        chat_id,
+        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
+        parse_mode=ParseMode.HTML
     )
 
-@Client.on_message(check_user & filters.command(["cancel"]))
-async def cancel_current(client: Client, message: Message):
-    chat_id = message.chat.id
-    job = running_jobs.get(chat_id)
-    if not job:
-        return await message.reply("ℹ️ Nothing to cancel.")
-    proc = job.get("proc")
-    if proc and proc.returncode is None:
+    await job_queue.put(Job(job_id, "nosub", chat_id, vid, None, final_name, status))
+    db.erase(chat_id)
+
+# ===== cancel handler =====
+
+@Client.on_message(check_user & filters.command(["cancel"]) & filters.private)
+async def cancel_job(client: Client, message: Message):
+    if len(message.command) != 2:
+        return await message.reply_text("Usage: /cancel <job_id>", parse_mode=ParseMode.HTML)
+    target = message.command[1]
+
+    # try removing from pending queue first
+    removed = False
+    temp_q  = asyncio.Queue()
+    while not job_queue.empty():
+        job = await job_queue.get()
+        if job.job_id == target:
+            removed = True
+            try:
+                await job.status_msg.edit(f"❌ Job <code>{target}</code> cancelled before start.", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        else:
+            await temp_q.put(job)
+        job_queue.task_done()
+    while not temp_q.empty():
+        await job_queue.put(await temp_q.get())
+
+    if removed:
+        return
+
+    # If running, kill ffmpeg by job_id
+    entry = running_jobs.get(target)
+    if not entry:
+        return await message.reply_text(f"No job `<code>{target}</code>` found.", parse_mode=ParseMode.HTML)
+
+    try:
+        entry["proc"].kill()
+    except Exception:
+        pass
+    for t in entry.get("tasks", []):
         try:
-            proc.terminate()
+            t.cancel()
         except Exception:
             pass
-    running_jobs.pop(chat_id, None)
-    await message.reply("🛑 Canceled current encode.")
+    await message.reply_text(f"🛑 Cancelled `<code>{target}</code>`.", parse_mode=ParseMode.HTML)
 
-async def queue_worker(app: Client):
-    """
-    Background worker: take jobs from the queue, run them, prompt for rename, upload, clean.
-    """
+# ===== queue worker (kept compatible with your current helper_func/mux.py) =====
+
+async def queue_worker(client: Client):
     while True:
-        job: Job = await job_queue.get()
-        t0 = time.time()
+        job = await job_queue.get()
         try:
             await job.status_msg.edit(
-                f"🚀 Starting <code>{job.mode}</code> (<code>{job.job_id}</code>)…",
+                f"▶️ Starting <code>{job.job_id}</code> ({job.mode})…  "
+                f"Use <code>/cancel {job.job_id}</code> to abort.",
                 parse_mode=ParseMode.HTML
             )
 
-            # Run the encode/mux
-            if job.mode == "softmux":
-                out_path = await softmux_vid(app, job.chat_id, job.vid, job.sub, job.status_msg, job.job_id)
-            elif job.mode == "hardmux":
-                out_path = await hardmux_vid(app, job.chat_id, job.vid, job.sub, job.status_msg, job.job_id)
+            if job.mode == "soft":
+                out_file = await softmux_vid(job.vid, job.sub, msg=job.status_msg)
+            elif job.mode == "hard":
+                out_file = await hardmux_vid(job.vid, job.sub, msg=job.status_msg)
             else:
-                out_path = await nosub_encode(app, job.chat_id, job.vid, job.status_msg, job.job_id)
+                out_file = await nosub_encode(job.vid, msg=job.status_msg)
 
-            if not out_path or not os.path.exists(out_path):
+            if not out_file:
                 await job.status_msg.edit("❌ Encode failed.", parse_mode=ParseMode.HTML)
                 job_queue.task_done()
                 continue
 
-            default_name = os.path.basename(out_path)
-            # Ask user for final name
-            final_name = await _ask_for_name(app, job.chat_id, job.mode, default_name)
-            final_path = os.path.join(Config.DOWNLOAD_DIR, final_name)
+            # rename to desired final name (user-chosen)
+            src = os.path.join(Config.DOWNLOAD_DIR, out_file)
+            dst = os.path.join(Config.DOWNLOAD_DIR, job.final_name)
+            try:
+                os.replace(src, dst)
+            except Exception:
+                dst = src  # fallback
 
-            # Physically rename if changed
-            if final_name != default_name:
-                try:
-                    os.replace(out_path, final_path)
-                except Exception as e:
-                    # If rename fails, fallback but tell the user
-                    await job.status_msg.edit(
-                        f"⚠️ Could not rename file ({e}). Using default: <code>{default_name}</code>.",
-                        parse_mode=ParseMode.HTML
-                    )
-                    final_name = default_name
-                    final_path = out_path
-            else:
-                final_path = out_path
-
-            # Upload
-            await _do_upload(app, job.chat_id, final_path, final_name, job.status_msg, t0, job.job_id)
-
-            await job.status_msg.edit(
-                f"✅ Job <code>{job.job_id}</code> done.",
-                parse_mode=ParseMode.HTML
+            # Upload with progress
+            t0 = time.time()
+            await client.send_document(
+                job.chat_id,
+                document=dst,
+                caption=job.final_name,
+                file_name=job.final_name,
+                progress=progress_bar,
+                progress_args=("Uploading…", job.status_msg, t0, job.job_id)
             )
 
-            # Cleanup best effort
-            for fn in (job.vid, job.sub):
+            await job.status_msg.edit(f"✅ Job <code>{job.job_id}</code> done.", parse_mode=ParseMode.HTML)
+
+            # best-effort cleanup
+            for fn in (job.vid, job.sub, job.final_name):
                 try:
                     if fn:
                         os.remove(os.path.join(Config.DOWNLOAD_DIR, fn))
                 except Exception:
                     pass
-            try:
-                os.remove(final_path)
-            except Exception:
-                pass
 
         except Exception as e:
             try:
