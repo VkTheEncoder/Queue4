@@ -58,10 +58,7 @@ async def save_doc(client, message):
     )
 
     tg_filename = os.path.basename(download_location)
-    try:
-        og_filename = message.document.filename
-    except:
-        og_filename = False
+    og_filename = getattr(getattr(message, "video", None), "file_name", None)
 
     if og_filename:
         #os.rename(Config.DOWNLOAD_DIR+'/'+tg_filename,Config.DOWNLOAD_DIR+'/'+og_filename)
@@ -69,7 +66,7 @@ async def save_doc(client, message):
     else :
         save_filename = tg_filename
 
-    ext = save_filename.split('.').pop()
+    ext = save_filename.split('.').pop().lower()
     filename = str(round(start_time))+'.'+ext
 
     if ext in ['srt','ass']:
@@ -182,7 +179,7 @@ async def save_url(client, message):
         url = message.text.strip()
 
     if save_filename and len(save_filename)>60:
-        return await client.sendMessage(chat_id, Chat.LONG_CUS_FILENAME)
+        return await client.send_message(chat_id, Chat.LONG_CUS_FILENAME)
 
     r = requests.get(url, stream=True, allow_redirects=True)
     if save_filename is None :
