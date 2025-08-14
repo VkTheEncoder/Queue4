@@ -7,38 +7,39 @@ from helper_func.mux import softmux_vid, hardmux_vid, nosub_encode, running_jobs
 from helper_func.progress_bar import progress_bar
 from helper_func.dbhelper import Database as Db
 from config import Config
-import uuid
-import time
-import os
-import asyncio
-import re
+import uuid, time, os, asyncio, re
 
 db = Db()
 
-# ---------------------------
-# Access control
-# ---------------------------
-async def _check_user(filt, client, message):
+# Accept both "/" and "!" (and "." if you like)
+PREFIXES = getattr(Config, "COMMAND_PREFIXES", ["/", "!"])
+
+# ---------- auth helper (do NOT rely on custom filter in decorators) ----------
+def _is_authorized(message: Message) -> bool:
+    allowed = getattr(Config, "ALLOWED_USERS", None)
+    if not allowed or allowed == "*" or allowed == ["*"]:
+        return True
     try:
-        return str(message.from_user.id) in Config.ALLOWED_USERS
+        uid = message.from_user.id if message.from_user else None
+        # handle ints or strings in ALLOWED_USERS
+        allowed_str = {str(x) for x in allowed}
+        return uid is not None and (str(uid) in allowed_str or uid in allowed)
     except Exception:
         return False
 
-check_user = filters.create(_check_user)
+async def _ensure_auth(message: Message) -> bool:
+    if _is_authorized(message):
+        return True
+    await message.reply_text("❌ You’re not allowed to use this bot.")
+    return False
 
-# ---------------------------
-# Rename prompt (reply-based)
-# ---------------------------
-# We can't use client.listen here, so we use a "pending rename" map.
-# When we prompt, we store {chat_id: {...}} and wait on an asyncio.Future.
-# The text handler below fulfills the future when the user replies.
-
+# ---------- rename prompt (reply-based; no client.listen) ----------
 PENDING_RENAME = {}  # chat_id -> {"future": asyncio.Future, "prompt_id": int, "default": str}
 
 def _sanitize_name(name: str, default_ext: str) -> str:
     name = (name or "").strip()
     name = re.sub(r'[\\/]+', '', name)                    # strip path separators
-    name = re.sub(r'[^A-Za-z0-9._ -]+', '', name).strip() # keep letters, numbers, dot, dash, underscore, space
+    name = re.sub(r'[^A-Za-z0-9._ -]+', '', name).strip() # keep safe chars
     if not name:
         name = f"output{default_ext}"
     if '.' not in os.path.basename(name):
@@ -49,7 +50,6 @@ def _sanitize_name(name: str, default_ext: str) -> str:
     return name
 
 async def _ask_for_name(app: Client, chat_id: int, default_name: str, timeout: int = 90) -> str:
-    # Ask user and wait for a reply to this prompt
     prompt = await app.send_message(
         chat_id,
         (
@@ -75,16 +75,12 @@ async def _ask_for_name(app: Client, chat_id: int, default_name: str, timeout: i
     try:
         user_text = await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
-        # timeout → use default
         try:
             await prompt.edit("⏱️ No response. Using default name.", parse_mode=ParseMode.HTML)
         except Exception:
             pass
         PENDING_RENAME.pop(chat_id, None)
         return default_name
-    finally:
-        # we won't pop here; the handler pops when fulfilling
-        pass
 
     if not user_text or user_text.lower() in (".", "skip"):
         try:
@@ -101,27 +97,30 @@ async def _ask_for_name(app: Client, chat_id: int, default_name: str, timeout: i
         pass
     return safe
 
-@Client.on_message(check_user & filters.text & filters.private)
+@Client.on_message(filters.text & filters.private)
 async def _capture_rename_response(client: Client, message: Message):
-    chat_id = message.chat.id
-    entry = PENDING_RENAME.get(chat_id)
+    # capture only if it’s a reply to our prompt
+    entry = PENDING_RENAME.get(message.chat.id)
     if not entry:
         return
-    # must be a reply to our prompt
     if not message.reply_to_message or message.reply_to_message.id != entry.get("prompt_id"):
         return
     fut: asyncio.Future = entry.get("future")
     if fut and not fut.done():
         fut.set_result(message.text.strip() if message.text else "")
-    # cleanup
-    PENDING_RENAME.pop(chat_id, None)
+    PENDING_RENAME.pop(message.chat.id, None)
 
-# ---------------------------
-# Command handlers
-# ---------------------------
+# ---------- quick health check ----------
+@Client.on_message(filters.private & filters.command(["ping"], prefixes=PREFIXES))
+async def ping(client: Client, message: Message):
+    if not await _ensure_auth(message):
+        return
+    await message.reply_text("pong ✅")
 
-@Client.on_message(check_user & filters.command(["softmux"]) & filters.private)
+# ---------- command handlers ----------
+@Client.on_message(filters.private & filters.command(["softmux"], prefixes=PREFIXES))
 async def enqueue_soft(client: Client, message: Message):
+    if not await _ensure_auth(message): return
     chat_id = message.from_user.id
 
     if not db.check_video(chat_id) or not db.check_sub(chat_id):
@@ -130,8 +129,7 @@ async def enqueue_soft(client: Client, message: Message):
         if not db.check_sub(chat_id):   msg.append("send a Subtitle file")
         return await client.send_message(chat_id, "❌ Please " + " and ".join(msg) + " first.", parse_mode=ParseMode.HTML)
 
-    # Old repo getters (your dbhelper also has shims now)
-    vid = db.get_vid_filename(chat_id)
+    vid = db.get_vid_filename(chat_id)  # old API (your dbhelper has shims too)
     sub = db.get_sub_filename(chat_id)
 
     default_final = db.get_filename(chat_id) or (os.path.splitext(vid)[0] + "_soft.mkv")
@@ -143,13 +141,12 @@ async def enqueue_soft(client: Client, message: Message):
         f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
         parse_mode=ParseMode.HTML
     )
-
     await job_queue.put(Job(job_id, "soft", chat_id, vid, sub, final_name, status))
-    # allow fresh uploads asap (matches your old flow)
     db.erase(chat_id)
 
-@Client.on_message(check_user & filters.command(["hardmux"]) & filters.private)
+@Client.on_message(filters.private & filters.command(["hardmux"], prefixes=PREFIXES))
 async def enqueue_hard(client: Client, message: Message):
+    if not await _ensure_auth(message): return
     chat_id = message.from_user.id
 
     if not db.check_video(chat_id) or not db.check_sub(chat_id):
@@ -170,12 +167,12 @@ async def enqueue_hard(client: Client, message: Message):
         f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
         parse_mode=ParseMode.HTML
     )
-
     await job_queue.put(Job(job_id, "hard", chat_id, vid, sub, final_name, status))
     db.erase(chat_id)
 
-@Client.on_message(check_user & filters.command(["nosub"]) & filters.private)
+@Client.on_message(filters.private & filters.command(["nosub"], prefixes=PREFIXES))
 async def enqueue_nosub(client: Client, message: Message):
+    if not await _ensure_auth(message): return
     chat_id = message.from_user.id
 
     if not db.check_video(chat_id):
@@ -191,21 +188,15 @@ async def enqueue_nosub(client: Client, message: Message):
         f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
         parse_mode=ParseMode.HTML
     )
-
     await job_queue.put(Job(job_id, "nosub", chat_id, vid, None, final_name, status))
     db.erase(chat_id)
 
-# ---------------------------
-# Cancel handler
-# ---------------------------
-
-@Client.on_message(check_user & filters.command(["cancel"]) & filters.private)
+# ---------- cancel current ----------
+@Client.on_message(filters.private & filters.command(["cancel"], prefixes=PREFIXES))
 async def cancel_current(client: Client, message: Message):
-    """
-    Cancels the *currently running* job for this chat (consistent with your old code).
-    """
+    if not await _ensure_auth(message): return
     chat_id = message.chat.id
-    entry = running_jobs.get(chat_id)  # old helper_func.mux maps by chat_id
+    entry = running_jobs.get(chat_id)
     if not entry:
         return await message.reply_text("ℹ️ Nothing to cancel.")
     proc = entry.get("proc")
@@ -217,15 +208,8 @@ async def cancel_current(client: Client, message: Message):
     running_jobs.pop(chat_id, None)
     await message.reply_text("🛑 Canceled current encode.")
 
-# ---------------------------
-# Queue worker
-# ---------------------------
-
+# ---------- queue worker ----------
 async def queue_worker(client: Client):
-    """
-    Pulls Job objects from helper_func.queue.job_queue and runs them.
-    Job = (job_id, mode, chat_id, vid, sub, final_name, status_msg)
-    """
     while True:
         job: Job = await job_queue.get()
         try:
@@ -233,8 +217,6 @@ async def queue_worker(client: Client):
                 f"▶️ Starting <code>{job.job_id}</code> ({job.mode})…",
                 parse_mode=ParseMode.HTML
             )
-
-            # Run encode/mux per mode; helper_func.mux returns the output BASENAME
             if job.mode == "soft":
                 out_basename = await softmux_vid(job.vid, job.sub, msg=job.status_msg)
             elif job.mode == "hard":
@@ -249,18 +231,13 @@ async def queue_worker(client: Client):
 
             src = os.path.join(Config.DOWNLOAD_DIR, out_basename)
             dst = os.path.join(Config.DOWNLOAD_DIR, job.final_name)
-
-            # Physically rename to user-specified final name
             try:
                 if os.path.abspath(src) != os.path.abspath(dst):
                     os.replace(src, dst)
             except Exception:
-                # If rename fails, just use the original file
                 dst = src
 
-            # Upload with progress wrapper compatible with your progress_bar
             t0 = time.time()
-
             async def _progress(current, total):
                 await progress_bar(current, total, 'Uploading…', job.status_msg, t0, job.job_id)
 
@@ -274,7 +251,6 @@ async def queue_worker(client: Client):
 
             await job.status_msg.edit(f"✅ Job <code>{job.job_id}</code> done.", parse_mode=ParseMode.HTML)
 
-            # Best-effort cleanup: original inputs + final output
             for fn in (job.vid, job.sub, job.final_name):
                 try:
                     if fn:
