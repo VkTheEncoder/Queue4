@@ -150,7 +150,7 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
             f"📊 <b>Size:</b> {_humanbytes(curr_size)}\n"
             f"⏱️ <b>Time:</b> {_fmt_hhmmss(curr_time)}\n"
             f"⚡ <b>Speed:</b> {f'{speed_x:.2f}x' if speed_x else 'N/A'}\n"
-            f"📈 <b>Progress:</b> {pct:.1f}%"
+            f"📈 <b>Progress:</b> {pct:.1f}%\n"
             f"⏳ <b>ETA:</b> {_fmt_time(eta_sec)}\n"
         )
         try:
