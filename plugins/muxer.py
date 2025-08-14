@@ -20,10 +20,10 @@ async def _check_user(filt, client, message):
 check_user = filters.create(_check_user)
 
 # ------------------------------------------------------------------------------
-# Wizard state: users can drop files first, then choose mode & name.
+# Wizard state: users drop files first, then choose mode & name.
 # ------------------------------------------------------------------------------
-# { chat_id: { 'vid_id','vid_name','sub_id','sub_name','mode','awaiting_name':bool } }
-PENDING = {}
+# Keyed by (chat_id, user_id) so it works in groups too.
+PENDING = {}   # { (chat_id, user_id): { 'vid_id','vid_name','sub_id','sub_name','mode','awaiting_name':bool } }
 
 def _mode_keyboard():
     return InlineKeyboardMarkup([[
@@ -36,11 +36,28 @@ def _is_subtitle_name(name: str) -> bool:
     n = (name or "").lower()
     return n.endswith(('.srt','.ass','.ssa','.vtt','.sub','.sbv','.smi'))
 
+def _tg_token(file_id: str, file_name: str) -> str:
+    # Pack Telegram file id and intended file name into one string understood by the worker
+    safe_name = os.path.basename(file_name) if file_name else "file.bin"
+    return f"tg:{file_id}::{safe_name}"
+
+def _parse_tg_token(token: str):
+    # Return (file_id, file_name) or (None, None)
+    if not token or not token.startswith("tg:"):
+        return None, None
+    try:
+        _, rest = token.split("tg:", 1)
+        file_id, file_name = rest.split("::", 1)
+        return file_id, os.path.basename(file_name)
+    except Exception:
+        return None, None
+
 # Capture incoming video/subtitle *without* downloading yet
-@Client.on_message((filters.video | filters.document) & check_user & filters.private)
+@Client.on_message((filters.video | filters.document) & check_user & (filters.private | filters.group))
 async def capture_media_first(client, message):
-    chat_id = message.from_user.id
-    st = PENDING.setdefault(chat_id, {})
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    st = PENDING.setdefault((chat_id, user_id), {})
 
     # If it's clearly a subtitle document
     if message.document and _is_subtitle_name(message.document.file_name or ""):
@@ -64,8 +81,9 @@ async def capture_media_first(client, message):
 # Mode selection
 @Client.on_callback_query(filters.regex(r"^mode:(hard|soft|nosub)$") & check_user)
 async def choose_mode(client, cq):
-    chat_id = cq.from_user.id
-    st = PENDING.setdefault(chat_id, {})
+    chat_id = cq.message.chat.id
+    user_id = cq.from_user.id
+    st = PENDING.setdefault((chat_id, user_id), {})
     mode = cq.data.split(":")[1]
     st['mode'] = mode
 
@@ -85,11 +103,12 @@ async def choose_mode(client, cq):
         parse_mode=ParseMode.HTML
     )
 
-# Receive the output name, then download & enqueue
-@Client.on_message(filters.text & check_user & filters.private)
+# Receive the output name, then ENQUEUE (downloads will happen inside the worker)
+@Client.on_message(filters.text & check_user & (filters.private | filters.group))
 async def receive_output_name(client, message):
-    chat_id = message.from_user.id
-    st = PENDING.get(chat_id)
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    st = PENDING.get((chat_id, user_id))
     if not st or not st.get('awaiting_name'):
         return  # ignore unrelated texts
 
@@ -106,32 +125,16 @@ async def receive_output_name(client, message):
         suffix = {'hard': '_hard.mp4', 'soft': '_soft.mkv', 'nosub': '_enc.mp4'}[st['mode']]
         final_name = base + suffix
     else:
-        final_name = txt
+        final_name = os.path.basename(txt)
 
     # Status message
-    status = await message.reply("📥 Preparing downloads…")
+    status = await message.reply("⏳ Queuing…")
 
-    # Download video (AFTER we collected instructions)
-    t0 = time.time()
-    v_local = await client.download_media(
-        st['vid_id'],
-        file_name=os.path.join(Config.DOWNLOAD_DIR, st['vid_name']),
-        progress=progress_bar,
-        progress_args=("Downloading File", status, t0, "DLVID")
-    )
+    # Build TG tokens instead of downloading now
+    vid_token = _tg_token(st['vid_id'], st['vid_name'])
+    sub_token = _tg_token(st['sub_id'], st['sub_name']) if st['mode'] in ('hard','soft') else None
 
-    # Download subtitle if needed
-    s_local = None
-    if st['mode'] in ('hard','soft'):
-        t1 = time.time()
-        s_local = await client.download_media(
-            st['sub_id'],
-            file_name=os.path.join(Config.DOWNLOAD_DIR, st['sub_name']),
-            progress=progress_bar,
-            progress_args=("Downloading Subtitle", status, t1, "DLSUB")
-        )
-
-    # Enqueue job
+    # Enqueue job (downloads happen in worker)
     job_id = uuid.uuid4().hex[:8]
     await status.edit(
         f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
@@ -141,28 +144,28 @@ async def receive_output_name(client, message):
         job_id,
         st['mode'],
         chat_id,
-        os.path.basename(v_local),
-        os.path.basename(s_local) if s_local else None,
+        vid_token,                 # <-- TG token, not a local filename
+        sub_token,                 # <-- TG token or None
         final_name,
         status
     ))
 
     # Clear wizard state
-    PENDING.pop(chat_id, None)
+    PENDING.pop((chat_id, user_id), None)
 
-# (Optional) command to clear current wizard state
-@Client.on_message(filters.command('reset') & check_user & filters.private)
+# Optional: clear current wizard state
+@Client.on_message(filters.command('reset') & check_user & (filters.private | filters.group))
 async def reset_pending(client, message):
-    PENDING.pop(message.from_user.id, None)
+    key = (message.chat.id, message.from_user.id)
+    PENDING.pop(key, None)
     await message.reply("🧹 Cleared pending setup. Send a video/subtitle again to start.")
 
 # ------------------------------------------------------------------------------
-# Legacy COMMAND workflows (kept for power users)
+# Legacy COMMAND workflows (kept for power users) — unchanged behavior
 # ------------------------------------------------------------------------------
-
-@Client.on_message(filters.command('softmux') & check_user & filters.private)
+@Client.on_message(filters.command('softmux') & check_user & (filters.private | filters.group))
 async def enqueue_soft(client, message):
-    chat_id = message.from_user.id
+    chat_id = message.chat.id
     vid     = db.get_vid_filename(chat_id)
     sub     = db.get_sub_filename(chat_id)
     if not vid or not sub:
@@ -181,9 +184,9 @@ async def enqueue_soft(client, message):
     await job_queue.put(Job(job_id, 'soft', chat_id, vid, sub, final_name, status))
     db.erase(chat_id)
 
-@Client.on_message(filters.command('hardmux') & check_user & filters.private)
+@Client.on_message(filters.command('hardmux') & check_user & (filters.private | filters.group))
 async def enqueue_hard(client, message):
-    chat_id = message.from_user.id
+    chat_id = message.chat.id
     vid     = db.get_vid_filename(chat_id)
     sub     = db.get_sub_filename(chat_id)
     if not vid or not sub:
@@ -202,9 +205,9 @@ async def enqueue_hard(client, message):
     await job_queue.put(Job(job_id, 'hard', chat_id, vid, sub, final_name, status))
     db.erase(chat_id)
 
-@Client.on_message(filters.command('nosub') & check_user & filters.private)
+@Client.on_message(filters.command('nosub') & check_user & (filters.private | filters.group))
 async def enqueue_nosub(client, message):
-    chat_id = message.from_user.id
+    chat_id = message.chat.id
     vid     = db.get_vid_filename(chat_id)
     if not vid:
         return await client.send_message(chat_id, 'First send a Video File', parse_mode=ParseMode.HTML)
@@ -220,7 +223,7 @@ async def enqueue_nosub(client, message):
     db.erase(chat_id)
 
 # Cancel a job (queued or running)
-@Client.on_message(filters.command('cancel') & check_user & filters.private)
+@Client.on_message(filters.command('cancel') & check_user & (filters.private | filters.group))
 async def cancel_job(client, message):
     if len(message.command) != 2:
         return await message.reply_text("Usage: /cancel <job_id>", parse_mode=ParseMode.HTML)
@@ -261,10 +264,12 @@ async def cancel_job(client, message):
     )
 
 # ------------------------------------------------------------------------------
-# Worker (unchanged)
+# Worker — now downloads INSIDE the queue, one job at a time
 # ------------------------------------------------------------------------------
 
 async def queue_worker(client: Client):
+    os.makedirs(Config.DOWNLOAD_DIR, exist_ok=True)
+
     while True:
         job = await job_queue.get()
 
@@ -274,12 +279,42 @@ async def queue_worker(client: Client):
             parse_mode=ParseMode.HTML
         )
 
+        # Resolve local filenames; if a TG token is supplied, download now (serialized)
+        local_vid = job.vid
+        local_sub = job.sub
+
+        # Video download
+        vid_id, vid_name = _parse_tg_token(job.vid)
+        if vid_id:
+            t0 = time.time()
+            local_vid = await client.download_media(
+                vid_id,
+                file_name=os.path.join(Config.DOWNLOAD_DIR, os.path.basename(vid_name or "video.mp4")),
+                progress=progress_bar,
+                progress_args=("Downloading File", job.status_msg, t0, f"DL-{job.job_id}")
+            )
+            local_vid = os.path.basename(local_vid)
+
+        # Subtitle download (if any)
+        if job.sub:
+            sub_id, sub_name = _parse_tg_token(job.sub)
+            if sub_id:
+                t1 = time.time()
+                local_sub = await client.download_media(
+                    sub_id,
+                    file_name=os.path.join(Config.DOWNLOAD_DIR, os.path.basename(sub_name or "subs.srt")),
+                    progress=progress_bar,
+                    progress_args=("Downloading Subtitle", job.status_msg, t1, f"DL-{job.job_id}")
+                )
+                local_sub = os.path.basename(local_sub)
+
+        # Encode
         if job.mode == 'soft':
-            out_file = await softmux_vid(job.vid, job.sub, msg=job.status_msg)
+            out_file = await softmux_vid(local_vid, local_sub, msg=job.status_msg)
         elif job.mode == 'hard':
-            out_file = await hardmux_vid(job.vid, job.sub, msg=job.status_msg)
+            out_file = await hardmux_vid(local_vid, local_sub, msg=job.status_msg)
         else:  # nosub
-            out_file = await nosub_encode(job.vid, msg=job.status_msg)
+            out_file = await nosub_encode(local_vid, msg=job.status_msg)
 
         if out_file:
             # rename to desired final name
@@ -291,22 +326,23 @@ async def queue_worker(client: Client):
                 dst = src  # fallback
 
             # upload as DOCUMENT with progress
-            t0 = time.time()
+            t2 = time.time()
             await client.send_document(
                 job.chat_id,
                 document=dst,
                 caption=job.final_name,
                 file_name=job.final_name,
                 progress=progress_bar,
-                progress_args=('Uploading…', job.status_msg, t0, job.job_id)
+                progress_args=('Uploading…', job.status_msg, t2, job.job_id)
             )
 
             await job.status_msg.edit(
-                f"✅ Job <code>{job.job_id}</code> done.", parse_mode=ParseMode.HTML
+                f"✅ Job <code>{job.job_id}</code> done.",
+                parse_mode=ParseMode.HTML
             )
 
             # cleanup
-            for fn in (job.vid, job.sub, job.final_name):
+            for fn in (local_vid, local_sub, job.final_name):
                 try:
                     if fn:
                         os.remove(os.path.join(Config.DOWNLOAD_DIR, fn))
