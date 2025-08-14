@@ -3,10 +3,10 @@ from config import Config
 from helper_func.settings_manager import SettingsManager
 from pyrogram.enums import ParseMode
 
-# job_id -> {'proc': Popen, 'tasks': [reader, waiter]}
+# Track running jobs so /cancel can kill ffmpeg
 running_jobs: dict[str, dict] = {}
 
-# Accept classic and -progress key/values
+# Parse both classic ffmpeg stats AND -progress key/value output
 progress_pattern = re.compile(
     r'(frame|fps|size|time|bitrate|speed|total_size|out_time_ms|progress)\s*=\s*(\S+)'
 )
@@ -18,6 +18,16 @@ def _humanbytes(n: int) -> str:
     i = int(math.floor(math.log(n, 1024))) if n > 0 else 0
     p = math.pow(1024, i)
     s = round(n / p, 2)
+    return f"{s} {units[i]}"
+
+def _humanrate(bps: float) -> str:
+    # bytes/sec -> "2.10 MB/s"
+    if bps <= 0:
+        return "N/A"
+    units = ["B/s","KB/s","MB/s","GB/s","TB/s"]
+    i = int(math.floor(math.log(bps, 1024))) if bps > 0 else 0
+    p = math.pow(1024, i)
+    s = round(bps / p, 2)
     return f"{s} {units[i]}"
 
 def _fmt_time(seconds: float) -> str:
@@ -57,7 +67,10 @@ async def _probe_duration(vid_path: str) -> float:
         return 0.0
 
 async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, input_size: int):
-    """Tail ffmpeg stderr and render a rich progress card."""
+    """
+    Tail ffmpeg stderr and render a rich progress card (Size / Speed / Elapsed / ETA / %)
+    with the Job ID visible.
+    """
     last_edit = 0.0
     curr_time = 0.0   # seconds processed
     curr_size = 0     # bytes written (from total_size)
@@ -90,7 +103,6 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
             except Exception:
                 pass
         elif 'size' in prog and prog['size'].endswith('kB'):
-            # classic stats like "size=  1234kB"
             try:
                 kb = float(prog['size'].replace('kB',''))
                 curr_size = int(kb * 1024)
@@ -117,13 +129,20 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
             pct = min(100.0, (curr_time / total_dur) * 100.0)
             if speed_x > 0:
                 eta_sec = max(0, int((total_dur - curr_time) / speed_x))
+            elif curr_time > 0:
+                # fallback ETA from avg processing rate
+                speed_factor = curr_time / (now - start)  # (sec encoded) per wall sec
+                if speed_factor > 0:
+                    eta_sec = max(0, int((total_dur - curr_time) / speed_factor))
 
         elapsed = now - start
+        avg_bps = curr_size / elapsed if elapsed > 0 else 0.0
 
         card = (
-            "📽️ <b>Encoding</b>\n\n"
-            f"📊 <b>Size:</b> {_humanbytes(curr_size)}\n"
-            f"⚡ <b>Speed:</b> {f'{speed_x:.2f}x' if speed_x else 'N/A'}\n"
+            f"📽️ <b>Encoding</b> [<code>{job_id}</code>]\n\n"
+            f"📊 <b>Size:</b> {_humanbytes(curr_size)}"
+            + (f" of {_humanbytes(input_size)}" if input_size else "") + "\n"
+            f"⚡ <b>Speed:</b> {_humanrate(avg_bps)}\n"
             f"⏱️ <b>Time Elapsed:</b> {_fmt_time(elapsed)}\n"
             f"⏳ <b>ETA:</b> {_fmt_time(eta_sec)}\n"
             f"📈 <b>Progress:</b> {pct:.1f}%"
@@ -134,6 +153,8 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
             pass
 
 
+# ============ SOFT-MUX ============
+
 async def softmux_vid(vid_filename: str, sub_filename: str, msg):
     start    = time.time()
     vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
@@ -143,11 +164,9 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg):
     out_path = os.path.join(Config.DOWNLOAD_DIR, output)
     sub_ext  = os.path.splitext(sub_filename)[1].lstrip('.')
 
-    # Pre-compute metrics for progress
     total_dur  = await _probe_duration(vid_path)
     input_size = os.path.getsize(vid_path) if os.path.exists(vid_path) else 0
 
-    # Force consistent progress output
     proc = await asyncio.create_subprocess_exec(
         'ffmpeg', '-hide_banner',
         '-progress', 'pipe:2', '-nostats',
@@ -192,11 +211,12 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg):
         return False
 
 
+# ============ HARD-MUX ============
+
 async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
     start    = time.time()
     cfg      = SettingsManager.get(msg.chat.id)
 
-    # User prefs
     res    = cfg.get('resolution','1920:1080')
     fps    = cfg.get('fps','original')
     codec  = cfg.get('codec','libx264')
@@ -206,11 +226,9 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
     vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
     sub_path = os.path.join(Config.DOWNLOAD_DIR, sub_filename)
 
-    # Probe for progress math
     total_dur  = await _probe_duration(vid_path)
     input_size = os.path.getsize(vid_path) if os.path.exists(vid_path) else 0
 
-    # Build filtergraph
     vf = [f"subtitles={sub_path}:fontsdir={Config.FONTS_DIR}"]
     if res != 'original':
         vf.append(f"scale={res}")
@@ -222,7 +240,6 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
     output   = f"{base}_hard.mp4"
     out_path = os.path.join(Config.DOWNLOAD_DIR, output)
 
-    # Consistent progress output
     proc = await asyncio.create_subprocess_exec(
         'ffmpeg','-hide_banner',
         '-progress', 'pipe:2', '-nostats',
@@ -261,6 +278,76 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
         err = await proc.stderr.read()
         await msg.edit(
             "❌ Error during hard-mux!\n\n"
+            f"<pre>{err.decode(errors='ignore')}</pre>",
+            parse_mode=ParseMode.HTML
+        )
+        return False
+
+
+# ============ NO-SUB (encode only) ============
+
+async def nosub_encode(vid_filename: str, msg):
+    start    = time.time()
+    cfg      = SettingsManager.get(msg.chat.id)
+
+    res    = cfg.get('resolution','1920:1080')
+    fps    = cfg.get('fps','original')
+    codec  = cfg.get('codec','libx264')
+    crf    = cfg.get('crf','27')
+    preset = cfg.get('preset','faster')
+
+    vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
+    total_dur  = await _probe_duration(vid_path)
+    input_size = os.path.getsize(vid_path) if os.path.exists(vid_path) else 0
+
+    vf = []
+    if res != 'original':
+        vf.append(f"scale={res}")
+    if fps != 'original':
+        vf.append(f"fps={fps}")
+    vf_args = ['-vf', ",".join(vf)] if vf else []
+
+    base     = os.path.splitext(vid_filename)[0]
+    output   = f"{base}_enc.mp4"
+    out_path = os.path.join(Config.DOWNLOAD_DIR, output)
+
+    proc = await asyncio.create_subprocess_exec(
+        'ffmpeg','-hide_banner',
+        '-progress','pipe:2','-nostats',
+        '-i', vid_path, *vf_args,
+        '-c:v', codec, '-preset', preset, '-crf', crf,
+        '-map','0:v:0','-map','0:a:0?',
+        '-c:a','copy',
+        '-y', out_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    job_id = uuid.uuid4().hex[:8]
+    reader = asyncio.create_task(read_stderr(start, msg, proc, job_id, total_dur, input_size))
+    waiter = asyncio.create_task(proc.wait())
+    running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter]}
+
+    await msg.edit(
+        f"🔄 Encode (no-sub) job started: <code>{job_id}</code>\n"
+        f"Send <code>/cancel {job_id}</code> to abort",
+        parse_mode=ParseMode.HTML
+    )
+
+    await asyncio.wait([reader, waiter])
+    running_jobs.pop(job_id, None)
+
+    if proc.returncode == 0:
+        await msg.edit(
+            f"✅ Encode `<code>{job_id}</code>` completed in {round(time.time()-start)}s",
+            parse_mode=ParseMode.HTML
+        )
+        await asyncio.sleep(2)
+        return output
+    else:
+        err = await proc.stderr.read()
+        await msg.edit(
+            "❌ Error during encode!\n\n"
             f"<pre>{err.decode(errors='ignore')}</pre>",
             parse_mode=ParseMode.HTML
         )
