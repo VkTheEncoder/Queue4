@@ -7,21 +7,21 @@ from helper_func.mux import softmux_vid, hardmux_vid, nosub_encode, running_jobs
 from helper_func.progress_bar import progress_bar
 from helper_func.dbhelper import Database as Db
 from config import Config
-import uuid, time, os, asyncio, re
+import uuid, time, os, asyncio, re, logging
 
+log = logging.getLogger("muxer")
 db = Db()
 
-# Accept both "/" and "!" (and "." if you like)
+# Accept both "/" and "!" unless overridden in Config
 PREFIXES = getattr(Config, "COMMAND_PREFIXES", ["/", "!"])
 
-# ---------- auth helper (do NOT rely on custom filter in decorators) ----------
+# ---------- auth (checked inside handlers so filters don’t block dispatch) ----------
 def _is_authorized(message: Message) -> bool:
     allowed = getattr(Config, "ALLOWED_USERS", None)
     if not allowed or allowed == "*" or allowed == ["*"]:
         return True
     try:
         uid = message.from_user.id if message.from_user else None
-        # handle ints or strings in ALLOWED_USERS
         allowed_str = {str(x) for x in allowed}
         return uid is not None and (str(uid) in allowed_str or uid in allowed)
     except Exception:
@@ -33,13 +33,13 @@ async def _ensure_auth(message: Message) -> bool:
     await message.reply_text("❌ You’re not allowed to use this bot.")
     return False
 
-# ---------- rename prompt (reply-based; no client.listen) ----------
+# ---------- rename prompt (reply-based; safe on v1/v2) ----------
 PENDING_RENAME = {}  # chat_id -> {"future": asyncio.Future, "prompt_id": int, "default": str}
 
 def _sanitize_name(name: str, default_ext: str) -> str:
     name = (name or "").strip()
-    name = re.sub(r'[\\/]+', '', name)                    # strip path separators
-    name = re.sub(r'[^A-Za-z0-9._ -]+', '', name).strip() # keep safe chars
+    name = re.sub(r'[\\/]+', '', name)
+    name = re.sub(r'[^A-Za-z0-9._ -]+', '', name).strip()
     if not name:
         name = f"output{default_ext}"
     if '.' not in os.path.basename(name):
@@ -52,16 +52,14 @@ def _sanitize_name(name: str, default_ext: str) -> str:
 async def _ask_for_name(app: Client, chat_id: int, default_name: str, timeout: int = 90) -> str:
     prompt = await app.send_message(
         chat_id,
-        (
-            "✍️ <b>Rename?</b>\n"
-            "Reply to <i>this message</i> with the file name you want (no path).\n"
-            f"Default: <code>{default_name}</code>\n\n"
-            "• Send <code>.</code> or <code>skip</code> to keep default."
-        ),
+        ("✍️ <b>Rename?</b>\n"
+         "Reply to <i>this message</i> with the file name you want (no path).\n"
+         f"Default: <code>{default_name}</code>\n\n"
+         "• Send <code>.</code> or <code>skip</code> to keep default."),
         parse_mode=ParseMode.HTML
     )
 
-    # ensure only one pending per chat
+    # only one pending per chat
     old = PENDING_RENAME.get(chat_id)
     if old:
         fut = old.get("future")
@@ -97,9 +95,9 @@ async def _ask_for_name(app: Client, chat_id: int, default_name: str, timeout: i
         pass
     return safe
 
-@Client.on_message(filters.text & filters.private)
+@Client.on_message(filters.text)
 async def _capture_rename_response(client: Client, message: Message):
-    # capture only if it’s a reply to our prompt
+    # capture only if it’s a reply to our prompt (works in private or group)
     entry = PENDING_RENAME.get(message.chat.id)
     if not entry:
         return
@@ -111,17 +109,16 @@ async def _capture_rename_response(client: Client, message: Message):
     PENDING_RENAME.pop(message.chat.id, None)
 
 # ---------- quick health check ----------
-@Client.on_message(filters.private & filters.command(["ping"], prefixes=PREFIXES))
+@Client.on_message(filters.command(["ping"], prefixes=PREFIXES))
 async def ping(client: Client, message: Message):
-    if not await _ensure_auth(message):
-        return
+    if not await _ensure_auth(message): return
     await message.reply_text("pong ✅")
 
-# ---------- command handlers ----------
-@Client.on_message(filters.private & filters.command(["softmux"], prefixes=PREFIXES))
+# ---------- command handlers (no filters.private; will work anywhere) ----------
+@Client.on_message(filters.command(["softmux"], prefixes=PREFIXES))
 async def enqueue_soft(client: Client, message: Message):
     if not await _ensure_auth(message): return
-    chat_id = message.from_user.id
+    chat_id = message.from_user.id if message.from_user else message.chat.id
 
     if not db.check_video(chat_id) or not db.check_sub(chat_id):
         msg = []
@@ -129,7 +126,7 @@ async def enqueue_soft(client: Client, message: Message):
         if not db.check_sub(chat_id):   msg.append("send a Subtitle file")
         return await client.send_message(chat_id, "❌ Please " + " and ".join(msg) + " first.", parse_mode=ParseMode.HTML)
 
-    vid = db.get_vid_filename(chat_id)  # old API (your dbhelper has shims too)
+    vid = db.get_vid_filename(chat_id)
     sub = db.get_sub_filename(chat_id)
 
     default_final = db.get_filename(chat_id) or (os.path.splitext(vid)[0] + "_soft.mkv")
@@ -137,17 +134,16 @@ async def enqueue_soft(client: Client, message: Message):
 
     job_id = uuid.uuid4().hex[:8]
     status = await client.send_message(
-        chat_id,
-        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
+        chat_id, f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
         parse_mode=ParseMode.HTML
     )
     await job_queue.put(Job(job_id, "soft", chat_id, vid, sub, final_name, status))
     db.erase(chat_id)
 
-@Client.on_message(filters.private & filters.command(["hardmux"], prefixes=PREFIXES))
+@Client.on_message(filters.command(["hardmux"], prefixes=PREFIXES))
 async def enqueue_hard(client: Client, message: Message):
     if not await _ensure_auth(message): return
-    chat_id = message.from_user.id
+    chat_id = message.from_user.id if message.from_user else message.chat.id
 
     if not db.check_video(chat_id) or not db.check_sub(chat_id):
         msg = []
@@ -163,17 +159,16 @@ async def enqueue_hard(client: Client, message: Message):
 
     job_id = uuid.uuid4().hex[:8]
     status = await client.send_message(
-        chat_id,
-        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
+        chat_id, f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
         parse_mode=ParseMode.HTML
     )
     await job_queue.put(Job(job_id, "hard", chat_id, vid, sub, final_name, status))
     db.erase(chat_id)
 
-@Client.on_message(filters.private & filters.command(["nosub"], prefixes=PREFIXES))
+@Client.on_message(filters.command(["nosub"], prefixes=PREFIXES))
 async def enqueue_nosub(client: Client, message: Message):
     if not await _ensure_auth(message): return
-    chat_id = message.from_user.id
+    chat_id = message.from_user.id if message.from_user else message.chat.id
 
     if not db.check_video(chat_id):
         return await client.send_message(chat_id, "❌ Please send a Video file first.", parse_mode=ParseMode.HTML)
@@ -184,15 +179,14 @@ async def enqueue_nosub(client: Client, message: Message):
 
     job_id = uuid.uuid4().hex[:8]
     status = await client.send_message(
-        chat_id,
-        f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
+        chat_id, f"🧾 Job <code>{job_id}</code> enqueued at position {job_queue.qsize() + 1}",
         parse_mode=ParseMode.HTML
     )
     await job_queue.put(Job(job_id, "nosub", chat_id, vid, None, final_name, status))
     db.erase(chat_id)
 
 # ---------- cancel current ----------
-@Client.on_message(filters.private & filters.command(["cancel"], prefixes=PREFIXES))
+@Client.on_message(filters.command(["cancel"], prefixes=PREFIXES))
 async def cancel_current(client: Client, message: Message):
     if not await _ensure_auth(message): return
     chat_id = message.chat.id
