@@ -38,6 +38,13 @@ def _fmt_time(seconds: float) -> str:
     if m: return f"{m}m {s}s"
     return f"{s}s"
 
+def _fmt_hhmmss(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 def parse_progress(line: str):
     items = {k: v for k, v in progress_pattern.findall(line)}
     return items or None
@@ -118,7 +125,7 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
 
         # Throttle UI updates (~once every 2s)
         now = time.time()
-        if now - last_edit < 2:
+        if now - last_edit < 5:
             continue
         last_edit = now
 
@@ -141,10 +148,10 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
         card = (
             f"📽️ <b>Encoding</b> [<code>{job_id}</code>]\n\n"
             f"📊 <b>Size:</b> {_humanbytes(curr_size)}\n"
+            f"⏱️ <b>Time:</b> {_fmt_hhmmss(curr_time)}\n"
             f"⚡ <b>Speed:</b> {f'{speed_x:.2f}x' if speed_x else 'N/A'}\n"
-            f"⏱️ <b>Time Elapsed:</b> {_fmt_time(elapsed)}\n"
-            f"⏳ <b>ETA:</b> {_fmt_time(eta_sec)}\n"
             f"📈 <b>Progress:</b> {pct:.1f}%"
+            f"⏳ <b>ETA:</b> {_fmt_time(eta_sec)}\n"
         )
         try:
             await msg.edit(card, parse_mode=ParseMode.HTML)
