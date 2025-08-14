@@ -1,34 +1,43 @@
-import os, time, re, uuid, asyncio, math
+import os
+import time
+import re
+import uuid
+import asyncio
+import math
+
 from config import Config
 from helper_func.settings_manager import SettingsManager
 from pyrogram.enums import ParseMode
 
 # Track running jobs so /cancel can kill ffmpeg
-running_jobs: dict[str, dict] = {}
+running_jobs = {}  # {job_id: {'proc': Popen, 'tasks': [reader, waiter]}}
 
 # Parse both classic ffmpeg stats AND -progress key/value output
 progress_pattern = re.compile(
     r'(frame|fps|size|time|bitrate|speed|total_size|out_time_ms|progress)\s*=\s*(\S+)'
 )
 
+
 def _humanbytes(n: int) -> str:
     if not n:
         return "0 B"
-    units = ["B","KB","MB","GB","TB","PB"]
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
     i = int(math.floor(math.log(n, 1024))) if n > 0 else 0
     p = math.pow(1024, i)
     s = round(n / p, 2)
     return f"{s} {units[i]}"
 
+
 def _humanrate(bps: float) -> str:
     # bytes/sec -> "2.10 MB/s"
     if bps <= 0:
         return "N/A"
-    units = ["B/s","KB/s","MB/s","GB/s","TB/s"]
+    units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"]
     i = int(math.floor(math.log(bps, 1024))) if bps > 0 else 0
     p = math.pow(1024, i)
     s = round(bps / p, 2)
     return f"{s} {units[i]}"
+
 
 def _fmt_hhmmss(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -37,9 +46,11 @@ def _fmt_hhmmss(seconds: float) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+
 def parse_progress(line: str):
     items = {k: v for k, v in progress_pattern.findall(line)}
     return items or None
+
 
 async def readlines(stream):
     """Yield complete lines from an asyncio stream (handles CR/LF splits)."""
@@ -51,6 +62,7 @@ async def readlines(stream):
         for line in parts:
             yield line
         data.extend(await stream.read(1024))
+
 
 async def _probe_duration(vid_path: str) -> float:
     """Return total duration (seconds) using ffprobe. 0.0 if unknown."""
@@ -65,9 +77,11 @@ async def _probe_duration(vid_path: str) -> float:
     except Exception:
         return 0.0
 
+
 def _ff_quote(path: str) -> str:
     """Quote for ffmpeg filter args (single-quoted string)."""
     return path.replace("\\", "\\\\").replace("'", "\\'")
+
 
 async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, input_size: int):
     """
@@ -106,7 +120,7 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
                 pass
         elif 'size' in prog and prog['size'].endswith('kB'):
             try:
-                kb = float(prog['size'].replace('kB',''))
+                kb = float(prog['size'].replace('kB', ''))
                 curr_size = int(kb * 1024)
             except Exception:
                 pass
@@ -154,9 +168,9 @@ async def read_stderr(start: float, msg, proc, job_id: str, total_dur: float, in
             pass
 
 
-# ============ SOFT-MUX ============
+# ===================== SOFT-MUX =====================
 
-async def softmux_vid(vid_filename: str, sub_filename: str, msg):
+async def softmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str):
     start    = time.time()
     vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
     sub_path = os.path.join(Config.DOWNLOAD_DIR, sub_filename)
@@ -190,14 +204,12 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg):
         stderr=asyncio.subprocess.PIPE
     )
 
-    job_id = uuid.uuid4().hex[:8]
     reader = asyncio.create_task(read_stderr(start, msg, proc, job_id, total_dur, input_size))
     waiter = asyncio.create_task(proc.wait())
     running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter]}
 
     await msg.edit(
-        f"🔄 Soft-Mux job started: <code>{job_id}</code>\n"
-        f"Send <code>/cancel {job_id}</code> to abort",
+        f"🔄 Soft-Mux started: <code>{job_id}</code>\nSend <code>/cancel {job_id}</code> to abort",
         parse_mode=ParseMode.HTML
     )
 
@@ -221,17 +233,17 @@ async def softmux_vid(vid_filename: str, sub_filename: str, msg):
         return False
 
 
-# ============ HARD-MUX ============
+# ===================== HARD-MUX =====================
 
-async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
+async def hardmux_vid(vid_filename: str, sub_filename: str, msg, job_id: str):
     start    = time.time()
     cfg      = SettingsManager.get(msg.chat.id)
 
-    res    = cfg.get('resolution','1920:1080')
-    fps    = cfg.get('fps','original')
-    codec  = cfg.get('codec','libx264')
-    crf    = cfg.get('crf','27')
-    preset = cfg.get('preset','faster')
+    res    = cfg.get('resolution', '1920:1080')
+    fps    = cfg.get('fps', 'original')
+    codec  = cfg.get('codec', 'libx264')
+    crf    = cfg.get('crf', '27')
+    preset = cfg.get('preset', 'faster')
 
     vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
     sub_path = os.path.join(Config.DOWNLOAD_DIR, sub_filename)
@@ -268,26 +280,24 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
     out_path = os.path.join(Config.DOWNLOAD_DIR, output)
 
     proc = await asyncio.create_subprocess_exec(
-        'ffmpeg','-hide_banner',
+        'ffmpeg', '-hide_banner',
         '-progress', 'pipe:2', '-nostats',
         '-i', vid_path,
         '-vf', vf_arg,
         '-c:v', codec, '-preset', preset, '-crf', crf,
-        '-map','0:v:0','-map','0:a:0?',
-        '-c:a','copy',
+        '-map', '0:v:0', '-map', '0:a:0?',  # keep video and (optional) first audio
+        '-c:a', 'copy',
         '-y', out_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
 
-    job_id = uuid.uuid4().hex[:8]
     reader = asyncio.create_task(read_stderr(start, msg, proc, job_id, total_dur, input_size))
     waiter = asyncio.create_task(proc.wait())
     running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter]}
 
     await msg.edit(
-        f"🔄 Hard-Mux job started: <code>{job_id}</code>\n"
-        f"Send <code>/cancel {job_id}</code> to abort",
+        f"🔄 Hard-Mux started: <code>{job_id}</code>\nSend <code>/cancel {job_id}</code> to abort",
         parse_mode=ParseMode.HTML
     )
 
@@ -311,17 +321,17 @@ async def hardmux_vid(vid_filename: str, sub_filename: str, msg):
         return False
 
 
-# ============ NO-SUB (encode only) ============
+# ===================== NO-SUB (encode only) =====================
 
-async def nosub_encode(vid_filename: str, msg):
+async def nosub_encode(vid_filename: str, msg, job_id: str):
     start    = time.time()
     cfg      = SettingsManager.get(msg.chat.id)
 
-    res    = cfg.get('resolution','1920:1080')
-    fps    = cfg.get('fps','original')
-    codec  = cfg.get('codec','libx264')
-    crf    = cfg.get('crf','27')
-    preset = cfg.get('preset','faster')
+    res    = cfg.get('resolution', '1920:1080')
+    fps    = cfg.get('fps', 'original')
+    codec  = cfg.get('codec', 'libx264')
+    crf    = cfg.get('crf', '27')
+    preset = cfg.get('preset', 'faster')
 
     vid_path = os.path.join(Config.DOWNLOAD_DIR, vid_filename)
 
@@ -344,25 +354,23 @@ async def nosub_encode(vid_filename: str, msg):
     out_path = os.path.join(Config.DOWNLOAD_DIR, output)
 
     proc = await asyncio.create_subprocess_exec(
-        'ffmpeg','-hide_banner',
-        '-progress','pipe:2','-nostats',
+        'ffmpeg', '-hide_banner',
+        '-progress', 'pipe:2', '-nostats',
         '-i', vid_path, *vf_args,
         '-c:v', codec, '-preset', preset, '-crf', crf,
-        '-map','0:v:0','-map','0:a:0?',
-        '-c:a','copy',
+        '-map', '0:v:0', '-map', '0:a:0?',
+        '-c:a', 'copy',
         '-y', out_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
 
-    job_id = uuid.uuid4().hex[:8]
     reader = asyncio.create_task(read_stderr(start, msg, proc, job_id, total_dur, input_size))
     waiter = asyncio.create_task(proc.wait())
     running_jobs[job_id] = {'proc': proc, 'tasks': [reader, waiter]}
 
     await msg.edit(
-        f"🔄 Encode (no-sub) job started: <code>{job_id}</code>\n"
-        f"Send <code>/cancel {job_id}</code> to abort",
+        f"🔄 Encode (no-sub) started: <code>{job_id}</code>\nSend <code>/cancel {job_id}</code> to abort",
         parse_mode=ParseMode.HTML
     )
 
