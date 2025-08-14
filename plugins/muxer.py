@@ -13,6 +13,17 @@ async def _check_user(filt, client, message):
     return str(message.from_user.id) in Config.ALLOWED_USERS
 check_user = filters.create(_check_user)
 
+async def _ask_for_name(client, chat_id, mode, vid, sub, default_name):
+    status = await client.send_message(
+        chat_id,
+        "✍️ Send the output file name <b>with extension</b> (or type <code>default</code> to keep it):\n\n"
+        f"<code>{default_name}</code>",
+        parse_mode=ParseMode.HTML
+    )
+    _PENDING_RENAME[chat_id] = dict(
+        mode=mode, vid=vid, sub=sub, default_name=default_name, status_msg=status
+    )
+
 # --------------------- COMMANDS ---------------------
 
 @Client.on_message(filters.command('softmux') & check_user & filters.private)
